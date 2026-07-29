@@ -1,0 +1,38 @@
+{
+  "test_name": "gru_factor-flow",
+  "factor_config": {
+    "test_name": NaN,
+    "factor_name": "gru_factor-flow",
+    "factor_delay": 0,
+    "pf": 1,
+    "pf_by_time": {
+      "1500_1": 0.4
+    },
+    "products": "ZeroIndex,Zhishu300,Zhishu500,Zhishu1000,Zhishu2000",
+    "factor_folder": "/mnt/hdd/users/yangxiaozhou/localshare/projects/Backtest_WZC/factor",
+    "report_folder": "/mnt/hdd/users/yangxiaozhou/localshare/projects/Backtest_WZC/portfolio/styleless",
+    "start_date": "20200103",
+    "end_date": "20251231",
+    "style_factors": "all",
+    "style_bands": 0.4,
+    "use_te_constraint": false,
+    "risk_delay": 1,
+    "debug_constraints": false,
+    "parallel": true,
+    "parallel_period": "year",
+    "parallel_max_workers": 10,
+    "parallel_warmup_days": 3,
+    "debug_time": false,
+    "show_progress": true,
+    "mosek_intpnt_tol_pfeas": NaN,
+    "mosek_intpnt_tol_dfeas": NaN,
+    "mosek_intpnt_tol_rel_gap": NaN,
+    "debug_mosek_tolerance": false,
+    "decompose_flag": true,
+    "factor_file": "/mnt/hdd/users/yangxiaozhou/localshare/projects/Backtest_WZC/factor/gru_factor-flow.parquet",
+    "execution_cache_root": "/mnt/hdd/users/yangxiaozhou/services/portfolio_optimizer_workspace/po_execution_cache",
+    "gmat_style_cache_root": "/mnt/hdd/users/yangxiaozhou/services/portfolio_optimizer_workspace/gmat_cache",
+    "gmat_style_cache_name": "rq_v2",
+    "progress_interval_sec": 30.0
+  }
+}

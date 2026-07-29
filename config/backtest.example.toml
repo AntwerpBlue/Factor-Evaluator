@@ -1,0 +1,74 @@
+# Copy to backtest.toml and replace every REPLACE_ME path.
+
+[paths]
+factor_values = "REPLACE_ME/factor_values.parquet"
+asset_forward_returns = "REPLACE_ME/asset_forward_returns.parquet"
+universe = "REPLACE_ME/universe.parquet"
+tradability = "REPLACE_ME/tradability.parquet"
+style_exposures = "REPLACE_ME/style_exposures.parquet"
+industry_exposures = "REPLACE_ME/industry_exposures.parquet"
+style_factor_returns = "REPLACE_ME/style_factor_returns.parquet"
+industry_factor_returns = "REPLACE_ME/industry_factor_returns.parquet"
+factor_covariance = "REPLACE_ME/factor_covariance.parquet"
+specific_risk = "REPLACE_ME/specific_risk.parquet"
+execution_prices = "REPLACE_ME/execution_prices.parquet"
+market_volume = "REPLACE_ME/market_volume.parquet"
+corporate_actions = "REPLACE_ME/corporate_actions.parquet"
+security_master = "REPLACE_ME/security_master.parquet"
+trading_calendar = "REPLACE_ME/trading_calendar.parquet"
+target_weights = "REPLACE_ME/target_weights.parquet"
+
+[benchmarks.ZeroIndex]
+returns = "REPLACE_ME/benchmark_zero_returns.parquet"
+weights = ""
+
+[benchmarks.Zhishu300]
+returns = "REPLACE_ME/benchmark_300_returns.parquet"
+weights = "REPLACE_ME/benchmark_300_weights.parquet"
+
+[benchmarks.Zhishu500]
+returns = "REPLACE_ME/benchmark_500_returns.parquet"
+weights = "REPLACE_ME/benchmark_500_weights.parquet"
+
+[benchmarks.Zhishu1000]
+returns = "REPLACE_ME/benchmark_1000_returns.parquet"
+weights = "REPLACE_ME/benchmark_1000_weights.parquet"
+
+[benchmarks.Zhishu2000]
+returns = "REPLACE_ME/benchmark_2000_returns.parquet"
+weights = "REPLACE_ME/benchmark_2000_weights.parquet"
+
+[factor]
+start_date = "20200101"
+end_date = "20251231"
+out_of_sample_start = "20250101"
+single_interval = true
+buckets = 30
+topk = 1.0
+power = 2.0
+annualization = 252
+max_lag = 10
+min_assets = 20
+test_basic_features = true
+test_basic_return = true
+test_style_features = true
+
+[portfolio]
+annualization = 240
+transaction_cost_bps = 8.0
+charge_initial_trade = false
+rebalance_frequency = 1
+max_deviation = 0.005
+max_holding = 0.005
+target_volatility = 0.05
+
+[portfolio.slot_weights]
+"1500_1" = 1.0
+
+[portfolio.pf_by_time]
+"1500_1" = 0.4
+
+[output]
+root = "REPLACE_ME/report"
+single_factor_folder = "single_factor"
+portfolio_folder = "portfolio"
