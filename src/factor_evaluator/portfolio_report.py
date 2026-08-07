@@ -40,13 +40,15 @@ def build_portfolio_summary(
     turnover_by_time: dict[str, float] = {}
     if asset_columns:
         turnover = trades.with_columns(
-            pl.sum_horizontal([pl.col(c).abs() for c in asset_columns]).alias("_turnover")
+            (0.5 * pl.sum_horizontal([pl.col(c).abs() for c in asset_columns])).alias("_turnover")
         )
         for slot in turnover["slot_key"].unique().to_list():
             turnover_by_time[slot] = float(
                 turnover.filter(pl.col("slot_key") == slot)["_turnover"].mean()
             )
     alpha_metric = _metric(alpha, periods)
+    peak_value = float(cumulative[start]) if len(cumulative) else float("nan")
+    trough_value = float(cumulative[end]) if len(cumulative) else float("nan")
     return {
         **alpha_metric,
         "n_days": len(alpha),
@@ -56,6 +58,8 @@ def build_portfolio_summary(
         "max_drawdown": max_dd,
         "max_drawdown_start": str(dates[start].date()),
         "max_drawdown_end": str(dates[end].date()),
+        "max_drawdown_start_value": peak_value,
+        "max_drawdown_end_value": trough_value,
         "annual_turnover": sum(turnover_by_time.values()) * periods,
         "turnover_by_time": turnover_by_time,
         "pf_by_time": dict(pf_by_time),
@@ -96,7 +100,27 @@ def write_performance_charts(result: Any, output: Path, prefix: str) -> list[Pat
         f"[{result.summary['max_drawdown_start']} - {result.summary['max_drawdown_end']}] "
         f"AnnualTVR={result.summary['annual_turnover']:.2f}"
     )
-    top.plot(dates, np.cumsum(pnl["alpha"].fill_null(0).to_numpy()), linewidth=2, label=alpha_label)
+    cumulative_alpha = np.cumsum(pnl["alpha"].fill_null(0).to_numpy())
+    top.plot(dates, cumulative_alpha, linewidth=2, label=alpha_label)
+    dd_start = result.summary.get("max_drawdown_start")
+    dd_end = result.summary.get("max_drawdown_end")
+    if dd_start and dd_end:
+        dd_start_dt = np.datetime64(dd_start).astype("datetime64[D]").astype(object)
+        dd_end_dt = np.datetime64(dd_end).astype("datetime64[D]").astype(object)
+        top.axvspan(dd_start_dt, dd_end_dt, color="#C00000", alpha=0.10, label="maxDD window")
+        start_value = result.summary.get("max_drawdown_start_value")
+        end_value = result.summary.get("max_drawdown_end_value")
+        if start_value is not None and end_value is not None and np.isfinite(start_value) and np.isfinite(end_value):
+            top.scatter([dd_start_dt, dd_end_dt], [start_value, end_value], color="#C00000", s=28, zorder=5)
+            top.annotate(
+                f"maxDD {result.summary['max_drawdown']:.2%}\n{dd_start} -> {dd_end}",
+                xy=(dd_end_dt, end_value),
+                xytext=(8, -24),
+                textcoords="offset points",
+                fontsize=8,
+                color="#8B0000",
+                arrowprops={"arrowstyle": "->", "color": "#8B0000", "linewidth": 0.8},
+            )
     top.axhline(0, color="#888888", linewidth=0.7)
     top.grid(alpha=0.2)
     top.legend(fontsize=8)
@@ -105,7 +129,7 @@ def write_performance_charts(result: Any, output: Path, prefix: str) -> list[Pat
     asset_columns = [c for c in result.trades.columns if c not in {"trade_ts", "slot_key"}]
     if asset_columns:
         turnover = result.trades.with_columns(
-            pl.sum_horizontal([pl.col(c).abs() for c in asset_columns]).alias("_turnover")
+            (0.5 * pl.sum_horizontal([pl.col(c).abs() for c in asset_columns])).alias("_turnover")
         )
         for slot in turnover["slot_key"].unique().to_list():
             subset = turnover.filter(pl.col("slot_key") == slot)

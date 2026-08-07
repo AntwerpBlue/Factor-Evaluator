@@ -1,16 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from scipy.optimize import minimize
+from scipy.optimize import linprog, minimize
 
 from .data import PortfolioDataset, normalize_panel
 from .metrics import annualized_return, annualized_volatility, safe_mean, sharpe_ratio
@@ -24,6 +24,17 @@ class IndexEnhancementConfig:
     max_active_weight: float = 0.01
     tracking_error: float | None = None
     long_only: bool = True
+    active_exposure_penalty: float = 0.0
+    turnover_cost_bps: float = 8.0
+    turnover_cost_alpha_fraction: float | None = None
+    max_turnover: float | None = None
+    active_exposure_limit: float | None = None
+    max_trade_weight: float | None = None
+    zero_benchmark: bool = False
+    require_covariance: bool = False
+    alpha_transform: Literal["none", "zscore", "rank_zscore"] = "zscore"
+    alpha_scale: float = 1.0
+    alpha_clip: float | None = 5.0
 
 
 class IndexEnhancementStrategy:
@@ -43,8 +54,13 @@ class IndexEnhancementStrategy:
         benchmark_weights: Mapping[str, float],
         previous_weights: Mapping[str, float] | None = None,
         covariance: np.ndarray | None = None,
+        assets: Sequence[str] | None = None,
+        exposure_matrix: np.ndarray | None = None,
     ) -> dict[str, float]:
-        assets = sorted(set(alpha) | set(benchmark_weights))
+        assets = list(assets) if assets is not None else sorted(set(alpha) | set(benchmark_weights))
+        missing_assets = (set(alpha) | set(benchmark_weights)) - set(assets)
+        if missing_assets:
+            raise ValueError("assets must include all alpha and benchmark names")
         if not assets:
             raise ValueError("alpha and benchmark_weights are empty")
         expected = np.asarray([alpha.get(asset, 0.0) for asset in assets], dtype=float)
@@ -52,102 +68,517 @@ class IndexEnhancementStrategy:
             [benchmark_weights.get(asset, 0.0) for asset in assets], dtype=float
         )
         if benchmark.sum() <= 0:
-            benchmark = np.full(len(assets), 1.0 / len(assets))
+            benchmark = (
+                np.zeros(len(assets), dtype=float)
+                if self.config.zero_benchmark
+                else np.full(len(assets), 1.0 / len(assets))
+            )
         else:
             benchmark /= benchmark.sum()
         previous = np.asarray(
-            [(previous_weights or benchmark_weights).get(asset, 0.0) for asset in assets],
+            [
+                (
+                    previous_weights.get(asset, 0.0)
+                    if previous_weights is not None
+                    else benchmark[index]
+                )
+                for index, asset in enumerate(assets)
+            ],
             dtype=float,
         )
-        previous = previous / previous.sum() if previous.sum() > 0 else benchmark.copy()
-        covariance = (
-            np.asarray(covariance, dtype=float)
-            if covariance is not None
-            else np.eye(len(assets), dtype=float)
-        )
+        if previous.sum() > 0:
+            previous /= previous.sum()
+        elif self.config.zero_benchmark:
+            previous = np.full(len(assets), 1.0 / len(assets))
+        else:
+            previous = benchmark.copy()
+        if covariance is None and self.config.require_covariance:
+            raise ValueError(
+                "Risk covariance is required but missing for the optimization date"
+            )
+        covariance = covariance if covariance is not None else np.eye(len(assets), dtype=float)
+        if covariance is not None and not hasattr(covariance, "shape"):
+            covariance = np.asarray(covariance, dtype=float)
         if covariance.shape != (len(assets), len(assets)):
             raise ValueError("covariance shape does not match optimizer universe")
+        exposure_matrix = (
+            np.asarray(exposure_matrix, dtype=float)
+            if exposure_matrix is not None
+            and (
+                self.config.active_exposure_penalty > 0
+                or self.config.active_exposure_limit is not None
+            )
+            else None
+        )
+        if exposure_matrix is not None and exposure_matrix.shape[0] != len(assets):
+            raise ValueError("exposure_matrix rows must match optimizer universe")
+
+        cost_rate = self.config.turnover_cost_bps / 10_000.0
+
+        def expected_alpha_gain(weight: np.ndarray) -> float:
+            return float(expected @ (weight - previous))
+
+        def turnover_cost(weight: np.ndarray) -> float:
+            turnover_delta = weight - previous
+            return float(cost_rate * np.abs(turnover_delta).sum())
+
+        def turnover_cost_jac(weight: np.ndarray) -> np.ndarray:
+            turnover_delta = weight - previous
+            return cost_rate * np.sign(turnover_delta)
+
+        def one_way_turnover(weight: np.ndarray) -> float:
+            turnover_delta = weight - previous
+            return float(0.5 * np.abs(turnover_delta).sum())
+
+        def one_way_turnover_jac(weight: np.ndarray) -> np.ndarray:
+            turnover_delta = weight - previous
+            return 0.5 * np.sign(turnover_delta)
 
         def objective(weight: np.ndarray) -> float:
             active = weight - benchmark
-            risk = float(active @ covariance @ active)
-            turnover = np.sqrt((weight - previous) ** 2 + 1e-12).sum()
+            risk = self._risk_quadratic(covariance, active)
+            turnover_delta = weight - previous
+            turnover = np.sqrt(turnover_delta**2 + 1e-12).sum()
+            exposure_penalty = 0.0
+            if exposure_matrix is not None:
+                active_exposure = exposure_matrix.T @ active
+                exposure_penalty = float(active_exposure @ active_exposure)
             return (
                 -float(expected @ weight)
                 + self.config.risk_aversion * risk
                 + self.config.turnover_penalty * turnover
+                + self.config.active_exposure_penalty * exposure_penalty
             )
 
-        lower = np.maximum(
-            0.0 if self.config.long_only else -self.config.max_weight,
-            benchmark - self.config.max_active_weight,
-        )
-        upper = np.minimum(
-            self.config.max_weight, benchmark + self.config.max_active_weight
-        )
+        def objective_jac(weight: np.ndarray) -> np.ndarray:
+            active = weight - benchmark
+            turnover_delta = weight - previous
+            turnover_grad = turnover_delta / np.sqrt(turnover_delta**2 + 1e-12)
+            gradient = (
+                -expected
+                + 2.0 * self.config.risk_aversion * self._risk_matvec(covariance, active)
+                + self.config.turnover_penalty * turnover_grad
+            )
+            if exposure_matrix is not None:
+                gradient += (
+                    2.0
+                    * self.config.active_exposure_penalty
+                    * (exposure_matrix @ (exposure_matrix.T @ active))
+                )
+            return gradient
+
+        if self.config.zero_benchmark:
+            lower = np.full(
+                len(assets), 0.0 if self.config.long_only else -self.config.max_weight
+            )
+            upper = np.full(len(assets), self.config.max_weight)
+        else:
+            lower = np.maximum(
+                0.0 if self.config.long_only else -self.config.max_weight,
+                benchmark - self.config.max_active_weight,
+            )
+            upper = np.minimum(
+                self.config.max_weight, benchmark + self.config.max_active_weight
+            )
+        if self.config.max_trade_weight is not None and previous_weights is not None:
+            max_trade_weight = float(self.config.max_trade_weight)
+            if max_trade_weight <= 0:
+                raise ValueError("max_trade_weight must be positive")
+            lower = np.maximum(lower, previous - max_trade_weight)
+            upper = np.minimum(upper, previous + max_trade_weight)
         if lower.sum() > 1.0 or upper.sum() < 1.0:
             raise ValueError("Weight bounds are infeasible; relax max_weight/max_active_weight")
         constraints: list[dict[str, Any]] = [
             {"type": "eq", "fun": lambda weight: float(weight.sum() - 1.0)}
         ]
+        if exposure_matrix is not None and self.config.active_exposure_limit is not None:
+            exposure_limit = float(self.config.active_exposure_limit)
+            if exposure_limit <= 0:
+                raise ValueError("active_exposure_limit must be positive")
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weight: exposure_limit
+                    - np.abs(exposure_matrix.T @ (weight - benchmark)),
+                }
+            )
+        initial = self._project_box_simplex(benchmark, lower, upper)
+        max_turnover = None
+        if self.config.max_turnover is not None:
+            max_turnover = float(self.config.max_turnover)
+            if max_turnover <= 0:
+                raise ValueError("max_turnover must be positive")
+
+        use_linear_program = (
+            self.config.risk_aversion == 0
+            and self.config.turnover_penalty == 0
+            and self.config.active_exposure_penalty == 0
+            and self.config.active_exposure_limit is None
+            and self.config.tracking_error is None
+            and self.config.turnover_cost_alpha_fraction is None
+        )
+        if use_linear_program:
+            solution = self._linear_optimize(
+                expected,
+                benchmark,
+                previous,
+                lower,
+                upper,
+                exposure_matrix,
+            )
+            solution = self._apply_turnover_cap(solution, previous, max_turnover)
+            solution = self._apply_turnover_alpha_fraction(
+                solution,
+                previous,
+                expected,
+                lower,
+                upper,
+                self.config.turnover_cost_alpha_fraction,
+                cost_rate,
+            )
+            return dict(zip(assets, solution))
+        use_slsqp = (
+            self.config.tracking_error is not None
+            or self.config.active_exposure_limit is not None
+        )
+        if not use_slsqp:
+            solution = self._projected_gradient_optimize(
+                initial,
+                lower,
+                upper,
+                objective,
+                objective_jac,
+                covariance,
+            )
+            solution = self._apply_turnover_cap(solution, previous, max_turnover)
+            solution = self._apply_turnover_alpha_fraction(
+                solution,
+                previous,
+                expected,
+                lower,
+                upper,
+                self.config.turnover_cost_alpha_fraction,
+                cost_rate,
+            )
+            return dict(zip(assets, solution))
+
         if self.config.tracking_error is not None:
             constraints.append(
                 {
                     "type": "ineq",
                     "fun": lambda weight: float(
                         self.config.tracking_error**2
-                        - (weight - benchmark) @ covariance @ (weight - benchmark)
+                        - self._risk_quadratic(covariance, weight - benchmark)
                     ),
+                    "jac": lambda weight: -2.0 * self._risk_matvec(covariance, weight - benchmark),
+                }
+            )
+        if use_slsqp and self.config.turnover_cost_alpha_fraction is not None:
+            fraction = float(self.config.turnover_cost_alpha_fraction)
+            if fraction <= 0:
+                raise ValueError("turnover_cost_alpha_fraction must be positive")
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weight: float(
+                        fraction * expected_alpha_gain(weight) - turnover_cost(weight)
+                    ),
+                    "jac": lambda weight: fraction * expected - turnover_cost_jac(weight),
+                }
+            )
+        if max_turnover is not None:
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weight: float(max_turnover - one_way_turnover(weight)),
+                    "jac": lambda weight: -one_way_turnover_jac(weight),
                 }
             )
         result = minimize(
             objective,
-            np.clip(benchmark, lower, upper),
+            initial,
             method="SLSQP",
+            jac=objective_jac,
             bounds=list(zip(lower, upper)),
             constraints=constraints,
             options={"maxiter": 500, "ftol": 1e-10},
         )
         if not result.success:
             raise RuntimeError(f"Index enhancement optimization failed: {result.message}")
-        return dict(zip(assets, result.x))
+        solution = self._apply_turnover_cap(result.x, previous, max_turnover)
+        solution = self._apply_turnover_alpha_fraction(
+            solution, previous, expected, lower, upper, self.config.turnover_cost_alpha_fraction, cost_rate
+        )
+        return dict(zip(assets, solution))
+
+    @staticmethod
+    def _apply_turnover_cap(
+        solution: np.ndarray,
+        previous: np.ndarray,
+        max_turnover: float | None,
+    ) -> np.ndarray:
+        if max_turnover is None:
+            return solution
+        turnover = 0.5 * float(np.abs(solution - previous).sum())
+        if turnover <= max_turnover + 1e-12:
+            return solution
+        scale = max_turnover / turnover
+        return previous + scale * (solution - previous)
+
+    @classmethod
+    def _apply_turnover_alpha_fraction(
+        cls,
+        solution: np.ndarray,
+        previous: np.ndarray,
+        expected: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        fraction: float | None,
+        cost_rate: float,
+    ) -> np.ndarray:
+        if fraction is None:
+            return solution
+        if fraction <= 0:
+            raise ValueError("turnover_cost_alpha_fraction must be positive")
+        if cls._turnover_alpha_fraction_ok(solution, previous, expected, fraction, cost_rate):
+            return solution
+        fallback = cls._project_box_simplex(previous, lower, upper)
+        return fallback
+
+    @staticmethod
+    def _turnover_alpha_fraction_ok(
+        weight: np.ndarray,
+        previous: np.ndarray,
+        expected: np.ndarray,
+        fraction: float,
+        cost_rate: float,
+    ) -> bool:
+        delta = weight - previous
+        traded = float(np.abs(delta).sum())
+        if traded <= 1e-12:
+            return True
+        cost = cost_rate * traded
+        alpha_gain = float(expected @ delta)
+        return alpha_gain > 0 and cost <= fraction * alpha_gain + 1e-12
+
+    @staticmethod
+    def _risk_matvec(covariance: Any, value: np.ndarray) -> np.ndarray:
+        if hasattr(covariance, "matvec"):
+            return covariance.matvec(value)
+        return np.asarray(covariance, dtype=float) @ value
+
+    @classmethod
+    def _risk_quadratic(cls, covariance: Any, value: np.ndarray) -> float:
+        if hasattr(covariance, "quadratic"):
+            return float(covariance.quadratic(value))
+        matrix = np.asarray(covariance, dtype=float)
+        return float(value @ matrix @ value)
+
+    @staticmethod
+    def _risk_spectral_bound(covariance: Any) -> float:
+        if hasattr(covariance, "max_eigenvalue_bound"):
+            return float(covariance.max_eigenvalue_bound())
+        matrix = np.asarray(covariance, dtype=float)
+        try:
+            return float(np.linalg.eigvalsh(matrix).max())
+        except np.linalg.LinAlgError:
+            return float(np.linalg.norm(matrix, ord=2))
+
+    @staticmethod
+    def _linear_optimize(
+        expected: np.ndarray,
+        benchmark: np.ndarray,
+        previous: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        exposure_matrix: np.ndarray | None,
+    ) -> np.ndarray:
+        del benchmark, previous, exposure_matrix
+        result = linprog(
+            -expected,
+            A_eq=np.ones((1, expected.size)),
+            b_eq=np.asarray([1.0]),
+            bounds=list(zip(lower, upper)),
+            method="highs",
+        )
+        if not result.success:
+            raise RuntimeError(f"Index enhancement linear optimization failed: {result.message}")
+        return np.asarray(result.x, dtype=float)
+
+    @staticmethod
+    def _project_box_simplex(
+        value: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+    ) -> np.ndarray:
+        if lower.sum() > 1.0 or upper.sum() < 1.0:
+            raise ValueError("Weight bounds are infeasible; relax max_weight/max_active_weight")
+        low = float(np.min(value - upper))
+        high = float(np.max(value - lower))
+        for _ in range(100):
+            mid = (low + high) / 2.0
+            projected = np.clip(value - mid, lower, upper)
+            if projected.sum() > 1.0:
+                low = mid
+            else:
+                high = mid
+        projected = np.clip(value - high, lower, upper)
+        total = projected.sum()
+        if total <= 0:
+            return lower.copy()
+        residual = 1.0 - total
+        if abs(residual) > 1e-12:
+            room = upper - projected if residual > 0 else projected - lower
+            room_sum = room.sum()
+            if room_sum > 0:
+                projected += residual * room / room_sum
+        return projected
+
+    @classmethod
+    def _projected_gradient_optimize(
+        cls,
+        initial: np.ndarray,
+        lower: np.ndarray,
+        upper: np.ndarray,
+        objective,
+        objective_jac,
+        covariance: np.ndarray,
+        *,
+        max_iter: int = 500,
+        tolerance: float = 1e-9,
+    ) -> np.ndarray:
+        weight = initial.copy()
+        spectral = cls._risk_spectral_bound(covariance)
+        step = 1.0 / max(2.0 * spectral + 1e-3, 1e-3)
+        value = objective(weight)
+        for _ in range(max_iter):
+            gradient = objective_jac(weight)
+            accepted = False
+            local_step = step
+            for _ in range(30):
+                candidate = cls._project_box_simplex(weight - local_step * gradient, lower, upper)
+                direction = candidate - weight
+                if np.linalg.norm(direction, ord=1) < tolerance:
+                    return candidate
+                candidate_value = objective(candidate)
+                if candidate_value <= value + 1e-4 * float(gradient @ direction):
+                    accepted = True
+                    break
+                local_step *= 0.5
+            if not accepted:
+                return weight
+            if abs(value - candidate_value) < tolerance:
+                return candidate
+            weight = candidate
+            value = candidate_value
+            step = min(local_step * 1.2, 10.0)
+        return weight
 
     def build_targets(
         self,
         signals: pl.DataFrame,
         benchmark_weights: pl.DataFrame,
-        covariance_by_date: Mapping[str, np.ndarray] | None = None,
+        covariance_by_date: Mapping[str, np.ndarray] | Callable[[str, list[str]], np.ndarray | None] | None = None,
+        exposure_by_date: Callable[[str, list[str]], np.ndarray | None] | None = None,
+        asset_returns: pl.DataFrame | None = None,
     ) -> pl.DataFrame:
         signal_panel = normalize_panel(signals)
         benchmark_panel = normalize_panel(benchmark_weights)
+        returns_panel = normalize_panel(asset_returns) if asset_returns is not None else None
         signal_columns = [c for c in signal_panel.columns if c not in {"date", "asset"}]
         weight_columns = [c for c in benchmark_panel.columns if c not in {"date", "asset"}]
         if len(signal_columns) != 1 or len(weight_columns) != 1:
             raise ValueError("signals and benchmark_weights each require one value column")
         signal_column, weight_column = signal_columns[0], weight_columns[0]
         signal_dates = {
-            day["date"][0]: dict(zip(day["asset"].to_list(), day[signal_column].to_list()))
+            day["date"][0]: self._prepare_alpha(day["asset"].to_list(), day[signal_column].to_list())
             for day in signal_panel.partition_by("date", maintain_order=True)
         }
         benchmark_dates = {
             day["date"][0]: dict(zip(day["asset"].to_list(), day[weight_column].to_list()))
             for day in benchmark_panel.partition_by("date", maintain_order=True)
         }
+        return_dates: dict[str, dict[str, float]] = {}
+        if returns_panel is not None:
+            return_columns = [c for c in returns_panel.columns if c not in {"date", "asset"}]
+            if not return_columns:
+                raise ValueError("asset_returns requires a return value column")
+            return_column = "return" if "return" in return_columns else return_columns[0]
+            return_dates = {
+                day["date"][0]: dict(zip(day["asset"].to_list(), day[return_column].to_list()))
+                for day in returns_panel.partition_by("date", maintain_order=True)
+            }
         rows = []
         previous: dict[str, float] | None = None
+        previous_date: str | None = None
         for date in sorted(set(signal_dates) & set(benchmark_dates)):
+            previous_for_opt = previous
+            if previous and previous_date in return_dates:
+                daily_returns = return_dates[previous_date]
+                assets_for_drift = set(previous) | set(daily_returns)
+                holding_pnl = sum(
+                    previous.get(asset, 0.0) * float(daily_returns.get(asset, 0.0) or 0.0)
+                    for asset in assets_for_drift
+                )
+                denominator = 1.0 + holding_pnl
+                previous_for_opt = {
+                    asset: previous.get(asset, 0.0)
+                    * (1.0 + float(daily_returns.get(asset, 0.0) or 0.0))
+                    / denominator
+                    for asset in assets_for_drift
+                }
+            assets = sorted(set(signal_dates[date]) | set(benchmark_dates[date]) | set(previous_for_opt or {}))
+            if callable(covariance_by_date):
+                covariance = covariance_by_date(date, assets)
+            else:
+                covariance = (covariance_by_date or {}).get(date)
+            exposure_matrix = exposure_by_date(date, assets) if exposure_by_date is not None else None
             weights = self.optimize(
                 signal_dates[date],
                 benchmark_dates[date],
-                previous,
-                (covariance_by_date or {}).get(date),
+                previous_for_opt,
+                covariance,
+                assets=assets,
+                exposure_matrix=exposure_matrix,
             )
             rows.extend(
                 {"date": date, "asset": asset, "weight": weight}
                 for asset, weight in weights.items()
             )
             previous = weights
+            previous_date = date
+        if not rows:
+            return pl.DataFrame(schema={"date": pl.String, "asset": pl.String, "weight": pl.Float64})
         return pl.DataFrame(rows)
+
+    def _prepare_alpha(self, assets: list[str], values: list[float]) -> dict[str, float]:
+        raw = np.asarray(values, dtype=float)
+        finite = np.isfinite(raw)
+        transformed = np.zeros_like(raw, dtype=float)
+        if finite.any():
+            valid = raw[finite]
+            if self.config.alpha_transform == "none":
+                transformed[finite] = valid
+            elif self.config.alpha_transform == "zscore":
+                mean = float(np.nanmean(valid))
+                std = float(np.nanstd(valid))
+                transformed[finite] = (valid - mean) / std if std > 1e-12 else 0.0
+            elif self.config.alpha_transform == "rank_zscore":
+                order = np.argsort(valid, kind="mergesort")
+                ranked = np.empty(valid.size, dtype=float)
+                ranked[order] = np.arange(1, valid.size + 1, dtype=float)
+                mean = float(ranked.mean())
+                std = float(ranked.std())
+                transformed[finite] = (ranked - mean) / std if std > 1e-12 else 0.0
+            else:
+                raise ValueError(f"Unknown alpha_transform: {self.config.alpha_transform}")
+        transformed *= float(self.config.alpha_scale)
+        if self.config.alpha_clip is not None:
+            clip = float(self.config.alpha_clip)
+            if clip <= 0:
+                raise ValueError("alpha_clip must be positive")
+            transformed = np.clip(transformed, -clip, clip)
+        return dict(zip(assets, transformed))
 
 
 @dataclass(frozen=True)
@@ -155,7 +586,7 @@ class PortfolioBacktestConfig:
     annualization: int = 240
     transaction_cost_bps: float = 8.0
     slot_weights: Mapping[str, float] = field(default_factory=lambda: {"1500_1": 1.0})
-    pf_by_time: Mapping[str, float] = field(default_factory=lambda: {"1500_1": 0.4})
+    pf_by_time: Mapping[str, float] = field(default_factory=lambda: {"1500_1": 0.9})
     max_deviation: float = 0.005
     max_holding: float = 0.005
     target_volatility: float = 0.05
@@ -211,8 +642,12 @@ class PortfolioBacktestResult:
             frame.write_parquet(path)
             files.append(path)
         summary_path = output / "intraday_summary.json"
+        summary_payload: dict[str, Any] = {}
+        if summary_path.exists():
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary_payload[product_name] = self.summary
         summary_path.write_text(
-            json.dumps({product_name: self.summary}, ensure_ascii=False, indent=2),
+            json.dumps(summary_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         files.append(summary_path)
@@ -272,8 +707,11 @@ class PortfolioBacktester:
         }
         benchmark = dict(data.benchmark.iter_rows())
         dates = sorted(set(returns_by_date) & set(benchmark))
+        if targets:
+            first_target_date = min(targets)
+            dates = [date for date in dates if date >= first_target_date]
         if not dates:
-            raise ValueError("No overlapping return and benchmark dates")
+            raise ValueError("No overlapping return, benchmark, and target dates")
         assets = sorted(
             set(data.returns["asset"].to_list())
             | {asset for target in targets.values() for asset in target}
@@ -285,25 +723,12 @@ class PortfolioBacktester:
         previous: dict[str, float] = {}
         previous_returns: dict[str, float] = {}
         latest_target: dict[str, float] = {}
+        realized_targets: dict[str, dict[str, float]] = {}
         cost_rate = self.config.transaction_cost_bps / 10_000.0
         slot_total = float(sum(self.config.slot_weights.values()))
         for index, date in enumerate(dates):
             daily_returns = returns_by_date[date]
-            holding_pnl = (
-                sum(previous.get(asset, 0.0) * daily_returns.get(asset, 0.0) for asset in assets)
-                if previous
-                else 0.0
-            )
-            if previous:
-                denominator = 1.0 + holding_pnl
-                pretrade = {
-                    asset: previous.get(asset, 0.0)
-                    * (1.0 + daily_returns.get(asset, 0.0))
-                    / denominator
-                    for asset in assets
-                }
-            else:
-                pretrade = {}
+            pretrade = previous
             if index % self.config.rebalance_frequency == 0 and date in targets:
                 latest_target = targets[date]
             target = latest_target or pretrade
@@ -317,10 +742,15 @@ class PortfolioBacktester:
                 trade = {asset: 0.0 for asset in assets}
                 turnover = 0.0
                 trading_pnl = 0.0
+            holding_pnl = sum(
+                target.get(asset, 0.0) * daily_returns.get(asset, 0.0)
+                for asset in assets
+            )
             bmk_ret = float(benchmark[date] or 0.0)
             holding_alpha = holding_pnl - bmk_ret
             alpha = holding_alpha + trading_pnl
             timestamp = self._timestamp(date)
+            realized_targets[date] = target
             for slot, allocation in self.config.slot_weights.items():
                 fraction = allocation / slot_total
                 portfolio_rows.append({
@@ -352,7 +782,13 @@ class PortfolioBacktester:
                     "__index_level_0__": self._date(date),
                 }
             )
-            previous = target
+            denominator = 1.0 + holding_pnl
+            previous = {
+                asset: target.get(asset, 0.0)
+                * (1.0 + daily_returns.get(asset, 0.0))
+                / denominator
+                for asset in assets
+            }
             previous_returns = daily_returns
         pnl = pl.DataFrame(pnl_rows)
         portfolio_frame = pl.DataFrame(portfolio_rows)
@@ -363,7 +799,7 @@ class PortfolioBacktester:
             pnl, trade_frame, self.config.annualization, dict(self.config.pf_by_time)
         )
         decomposition = self._decompose(
-            dates, previous_targets=self._lag_targets(dates, targets), dataset=data, pnl=pnl
+            dates, previous_targets=realized_targets, dataset=data, pnl=pnl
         )
         return PortfolioBacktestResult(
             portfolio=portfolio_frame,
@@ -444,12 +880,19 @@ class PortfolioBacktester:
                 c for c in dataset.benchmark_weights.columns if c not in {"date", "asset"}
             ]
             weight_column = "weight" if "weight" in weight_columns else weight_columns[0]
-            benchmark_weights = {
-                day["date"][0]: dict(zip(day["asset"].to_list(), day[weight_column].to_list()))
-                for day in dataset.benchmark_weights.partition_by("date", maintain_order=True)
-            }
+            benchmark_weights = {}
+            for day in dataset.benchmark_weights.partition_by("date", maintain_order=True):
+                raw = np.asarray(day[weight_column].to_list(), dtype=float)
+                total = float(np.nansum(raw))
+                weights = raw / total if total > 0 else raw
+                benchmark_weights[day["date"][0]] = dict(zip(day["asset"].to_list(), weights))
         style_return_map = self._style_return_map(dataset, style_columns)
         industry_return_map = self._industry_return_map(dataset)
+        fallback_style_returns, fallback_industry_returns = self._cross_sectional_return_maps(
+            dataset, style_columns
+        )
+        style_return_map = {**fallback_style_returns, **style_return_map}
+        industry_return_map = {**fallback_industry_returns, **industry_return_map}
         rows = []
         for index, date in enumerate(dates):
             pnl_row = pnl.row(index, named=True)
@@ -487,6 +930,68 @@ class PortfolioBacktester:
                 }
             )
         return pl.DataFrame(rows)
+
+    @staticmethod
+    def _cross_sectional_return_maps(
+        dataset: PortfolioDataset,
+        style_columns: list[str],
+    ) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float]]:
+        if dataset.styles is None and dataset.industry_exposures is None:
+            return {}, {}
+        joined = dataset.returns
+        if dataset.styles is not None and style_columns:
+            joined = joined.join(dataset.styles.select("date", "asset", *style_columns), on=["date", "asset"], how="left")
+        industry_columns: list[str] = []
+        categorical_industry = False
+        if dataset.industry_exposures is not None:
+            if "industry" in dataset.industry_exposures.columns:
+                categorical_industry = True
+                joined = joined.join(dataset.industry_exposures.select("date", "asset", "industry"), on=["date", "asset"], how="left")
+            else:
+                industry_columns = [
+                    c for c in dataset.industry_exposures.columns if c not in {"date", "asset"}
+                ]
+                joined = joined.join(
+                    dataset.industry_exposures.select("date", "asset", *industry_columns),
+                    on=["date", "asset"],
+                    how="left",
+                )
+        style_map: dict[tuple[str, str], float] = {}
+        industry_map: dict[tuple[str, str], float] = {}
+        for day in joined.partition_by("date", maintain_order=True):
+            date = day["date"][0]
+            y = day["return"].fill_null(0.0).to_numpy().astype(float)
+            columns: list[tuple[str, str]] = []
+            matrix_parts: list[np.ndarray] = []
+            for style in style_columns:
+                if style in day.columns:
+                    matrix_parts.append(day[style].fill_null(0.0).to_numpy().astype(float))
+                    columns.append(("style", style))
+            if categorical_industry and "industry" in day.columns:
+                industries = sorted(
+                    str(value) for value in day["industry"].drop_nulls().unique().to_list()
+                )
+                for industry in industries:
+                    matrix_parts.append((day["industry"].cast(pl.String) == industry).cast(pl.Float64).to_numpy())
+                    columns.append(("industry", industry))
+            else:
+                for industry in industry_columns:
+                    if industry in day.columns:
+                        matrix_parts.append(day[industry].fill_null(0.0).to_numpy().astype(float))
+                        columns.append(("industry", industry))
+            if not matrix_parts or len(y) <= len(matrix_parts):
+                continue
+            x = np.column_stack(matrix_parts)
+            valid = np.isfinite(y) & np.isfinite(x).all(axis=1)
+            if valid.sum() <= x.shape[1]:
+                continue
+            coefficients = np.linalg.lstsq(x[valid], y[valid], rcond=None)[0]
+            for (kind, name), coefficient in zip(columns, coefficients):
+                if kind == "style":
+                    style_map[(date, name)] = float(coefficient)
+                else:
+                    industry_map[(date, name)] = float(coefficient)
+        return style_map, industry_map
 
     @staticmethod
     def _industry_return_map(

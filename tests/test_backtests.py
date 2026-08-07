@@ -47,6 +47,10 @@ def test_factor_schema_and_predictive_ic(tmp_path):
         "date",
         "lb",
         "ls",
+        "lb_tvr",
+        "ls_tvr",
+        "lb_limit",
+        "ls_limit",
         "ic",
         "factor_return",
         "topk_power_lb",
@@ -82,6 +86,36 @@ def test_portfolio_accounting_and_export(tmp_path):
     assert "alpha_ZeroIndex_decomp.csv" in names
 
 
+def test_portfolio_targets_earn_same_date_returns():
+    weights = pl.DataFrame(
+        [
+            {"date": "20240102", "header": "000001", "weight": 1.0},
+            {"date": "20240102", "header": "000002", "weight": 0.0},
+            {"date": "20240103", "header": "000001", "weight": 0.0},
+            {"date": "20240103", "header": "000002", "weight": 1.0},
+        ]
+    )
+    returns = pl.DataFrame(
+        [
+            {"date": "20240102", "header": "000001", "return": 0.10},
+            {"date": "20240102", "header": "000002", "return": 0.00},
+            {"date": "20240103", "header": "000001", "return": 0.00},
+            {"date": "20240103", "header": "000002", "return": 0.20},
+        ]
+    )
+    benchmark = pl.DataFrame(
+        [
+            {"date": "20240102", "benchmark_return": 0.0},
+            {"date": "20240103", "benchmark_return": 0.0},
+        ]
+    )
+    result = PortfolioBacktester(PortfolioBacktestConfig(transaction_cost_bps=0)).run(
+        weights, PortfolioDataset(returns, benchmark)
+    )
+
+    np.testing.assert_allclose(result.pnl_daily["holding_pnl"].to_numpy(), [0.10, 0.20])
+
+
 def test_index_enhancement_constraints():
     assets = [f"A{i}" for i in range(8)]
     benchmark = {asset: 1 / len(assets) for asset in assets}
@@ -94,3 +128,155 @@ def test_index_enhancement_constraints():
     assert min(weight.values()) >= 0
     assert max(weight.values()) <= 0.25 + 1e-8
     assert max(abs(weight[asset] - benchmark[asset]) for asset in assets) <= 0.08 + 1e-8
+
+def test_index_enhancement_max_turnover_cap():
+    assets = [f"A{i}" for i in range(8)]
+    benchmark = {asset: 1 / len(assets) for asset in assets}
+    previous = benchmark.copy()
+    alpha = {asset: float(i) for i, asset in enumerate(assets)}
+    strategy = IndexEnhancementStrategy(
+        IndexEnhancementConfig(
+            max_weight=0.25,
+            max_active_weight=0.08,
+            turnover_penalty=0.0,
+            max_turnover=0.05,
+        )
+    )
+    weight = strategy.optimize(alpha, benchmark, previous_weights=previous)
+    one_way_turnover = 0.5 * sum(abs(weight[asset] - previous[asset]) for asset in assets)
+    assert abs(sum(weight.values()) - 1.0) < 1e-8
+    assert one_way_turnover <= 0.0501
+
+def test_index_enhancement_pf_gate_blocks_uneconomic_turnover():
+    benchmark = {"A": 0.5, "B": 0.5}
+    previous = benchmark.copy()
+    strategy = IndexEnhancementStrategy(
+        IndexEnhancementConfig(
+            risk_aversion=0.0,
+            turnover_penalty=0.0,
+            max_weight=1.0,
+            max_active_weight=0.5,
+            turnover_cost_bps=8.0,
+            turnover_cost_alpha_fraction=0.9,
+        )
+    )
+
+    weight = strategy.optimize({"A": 0.001, "B": 0.0}, benchmark, previous_weights=previous)
+
+    np.testing.assert_allclose([weight["A"], weight["B"]], [0.5, 0.5], atol=1e-8)
+
+
+def test_index_enhancement_pf_gate_allows_economic_turnover():
+    benchmark = {"A": 0.5, "B": 0.5}
+    previous = benchmark.copy()
+    strategy = IndexEnhancementStrategy(
+        IndexEnhancementConfig(
+            risk_aversion=0.0,
+            turnover_penalty=0.0,
+            max_weight=1.0,
+            max_active_weight=0.5,
+            turnover_cost_bps=8.0,
+            turnover_cost_alpha_fraction=0.9,
+        )
+    )
+
+    weight = strategy.optimize({"A": 0.01, "B": 0.0}, benchmark, previous_weights=previous)
+    delta = {asset: weight[asset] - previous[asset] for asset in weight}
+    traded = sum(abs(value) for value in delta.values())
+    cost = 8.0 / 10_000.0 * traded
+    alpha_gain = sum({"A": 0.01, "B": 0.0}[asset] * delta[asset] for asset in delta)
+
+    assert weight["A"] > previous["A"]
+    assert cost <= 0.9 * alpha_gain + 1e-12
+
+
+def test_build_targets_uses_drifted_previous_weights_for_turnover_cap():
+    signals = pl.DataFrame(
+        [
+            {"date": "20240102", "header": "000001", "alpha": 10.0},
+            {"date": "20240102", "header": "000002", "alpha": 0.0},
+            {"date": "20240103", "header": "000001", "alpha": 0.0},
+            {"date": "20240103", "header": "000002", "alpha": 10.0},
+        ]
+    )
+    benchmark = pl.DataFrame(
+        [
+            {"date": "20240102", "header": "000001", "weight": 0.5},
+            {"date": "20240102", "header": "000002", "weight": 0.5},
+            {"date": "20240103", "header": "000001", "weight": 0.5},
+            {"date": "20240103", "header": "000002", "weight": 0.5},
+        ]
+    )
+    returns = pl.DataFrame(
+        [
+            {"date": "20240102", "header": "000001", "return": 1.0},
+            {"date": "20240102", "header": "000002", "return": 0.0},
+        ]
+    )
+    strategy = IndexEnhancementStrategy(
+        IndexEnhancementConfig(
+            max_weight=0.8,
+            max_active_weight=0.5,
+            turnover_penalty=0.0,
+            max_turnover=0.01,
+        )
+    )
+    targets = strategy.build_targets(signals, benchmark, asset_returns=returns)
+    day1 = dict(targets.filter(pl.col("date") == "20240102").select("asset", "weight").iter_rows())
+    day2 = dict(targets.filter(pl.col("date") == "20240103").select("asset", "weight").iter_rows())
+    day2_returns = {"000001": 1.0, "000002": 0.0}
+    holding_pnl = sum(day1.get(asset, 0.0) * day2_returns.get(asset, 0.0) for asset in day1)
+    pretrade = {
+        asset: day1.get(asset, 0.0) * (1.0 + day2_returns.get(asset, 0.0)) / (1.0 + holding_pnl)
+        for asset in day1
+    }
+    one_way_turnover = 0.5 * sum(
+        abs(day2.get(asset, 0.0) - pretrade.get(asset, 0.0))
+        for asset in set(day2) | set(pretrade)
+    )
+    assert one_way_turnover <= 0.0101
+
+def test_index_enhancement_linear_path_when_risk_is_disabled():
+    assets = [f"A{i}" for i in range(6)]
+    benchmark = {asset: 1 / len(assets) for asset in assets}
+    alpha = {asset: float(i) for i, asset in enumerate(assets)}
+    strategy = IndexEnhancementStrategy(
+        IndexEnhancementConfig(
+            risk_aversion=0.0,
+            turnover_penalty=0.0,
+            max_weight=0.30,
+            max_active_weight=0.20,
+        )
+    )
+    weight = strategy.optimize(alpha, benchmark)
+    assert abs(sum(weight.values()) - 1.0) < 1e-8
+    assert weight["A5"] >= weight["A0"]
+    assert max(weight.values()) <= 0.30 + 1e-8
+
+def test_portfolio_backtest_starts_at_first_target_date():
+    weights = pl.DataFrame(
+        [
+            {"date": "20240103", "header": "000001", "weight": 1.0},
+            {"date": "20240103", "header": "000002", "weight": 0.0},
+        ]
+    )
+    returns = pl.DataFrame(
+        [
+            {"date": "20240102", "header": "000001", "return": 0.50},
+            {"date": "20240102", "header": "000002", "return": 0.00},
+            {"date": "20240103", "header": "000001", "return": 0.10},
+            {"date": "20240103", "header": "000002", "return": 0.00},
+        ]
+    )
+    benchmark = pl.DataFrame(
+        [
+            {"date": "20240102", "benchmark_return": 0.0},
+            {"date": "20240103", "benchmark_return": 0.0},
+        ]
+    )
+    result = PortfolioBacktester(PortfolioBacktestConfig(transaction_cost_bps=0)).run(
+        weights, PortfolioDataset(returns, benchmark)
+    )
+    assert result.summary["n_days"] == 1
+    assert result.pnl_daily["__index_level_0__"][0].strftime("%Y%m%d") == "20240103"
+    np.testing.assert_allclose(result.pnl_daily["holding_pnl"].to_numpy(), [0.10])

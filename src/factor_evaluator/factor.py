@@ -212,7 +212,7 @@ class FactorBacktester:
         ] + sorted(style for style in bucket_exposure if style not in preferred_styles)
         for index, style in enumerate(ordered_styles, start=11):
             rows = bucket_exposure[style]
-            tables[f"{index:02d}_bucket_exp_{style}"[:31]] = pl.DataFrame(rows)
+            tables[f"{index:02d}_bucket_exp_{style}"] = pl.DataFrame(rows)
         return FactorBacktestResult(
             tables=tables,
             daily=daily_results,
@@ -256,6 +256,8 @@ class FactorBacktester:
         bucket_observations: list[dict[str, Any]] = []
         weights_by_date: dict[str, dict[str, float]] = {}
         previous_weights: dict[str, float] = {}
+        previous_lb_weights: dict[str, float] = {}
+        previous_ls_weights: dict[str, float] = {}
         clean = joined.select("date", "asset", factor, "return").drop_nulls([factor, "return"])
         for day in clean.partition_by("date", maintain_order=True):
             date = day["date"][0]
@@ -274,8 +276,28 @@ class FactorBacktester:
                 self.config.buckets,
             )
             bmk = float(benchmark_map.get(date, 0.0) or 0.0)
-            long_return = safe_mean(asset_return[bucket == self.config.buckets])
-            short_return = safe_mean(asset_return[bucket == 1])
+            long_mask = bucket == self.config.buckets
+            short_mask = bucket == 1
+            long_return = safe_mean(asset_return[long_mask])
+            short_return = safe_mean(asset_return[short_mask])
+            lb_raw = long_mask.astype(float)
+            lb_weights_array = lb_raw / lb_raw.sum() if lb_raw.sum() > 0 else lb_raw
+            lb_weights = dict(zip(assets, lb_weights_array))
+            ls_raw = np.where(long_mask, 0.5, np.where(short_mask, -0.5, 0.0))
+            long_count = max(int(long_mask.sum()), 1)
+            short_count = max(int(short_mask.sum()), 1)
+            ls_weights_array = np.where(long_mask, 0.5 / long_count, np.where(short_mask, -0.5 / short_count, 0.0))
+            ls_weights = dict(zip(assets, ls_weights_array))
+            lb_turnover = 0.5 * sum(
+                abs(lb_weights.get(asset, 0.0) - previous_lb_weights.get(asset, 0.0))
+                for asset in set(lb_weights) | set(previous_lb_weights)
+            )
+            ls_turnover = 0.5 * sum(
+                abs(ls_weights.get(asset, 0.0) - previous_ls_weights.get(asset, 0.0))
+                for asset in set(ls_weights) | set(previous_ls_weights)
+            )
+            previous_lb_weights = lb_weights
+            previous_ls_weights = ls_weights
             centered = signal - safe_mean(signal)
             denominator = float(np.dot(centered, centered))
             factor_return = (
@@ -306,6 +328,10 @@ class FactorBacktester:
                     "date": date,
                     "lb": long_return - bmk,
                     "ls": long_return - short_return,
+                    "lb_tvr": lb_turnover,
+                    "ls_tvr": ls_turnover,
+                    "lb_limit": 0.0,
+                    "ls_limit": 0.0,
                     "ic": rank_correlation(signal, asset_return),
                     "factor_return": factor_return,
                     "topk_power_lb": topk_return - bmk,
@@ -330,6 +356,10 @@ class FactorBacktester:
             "date": pl.String,
             "lb": pl.Float64,
             "ls": pl.Float64,
+            "lb_tvr": pl.Float64,
+            "ls_tvr": pl.Float64,
+            "lb_limit": pl.Float64,
+            "ls_limit": pl.Float64,
             "ic": pl.Float64,
             "factor_return": pl.Float64,
             "topk_power_lb": pl.Float64,
@@ -429,11 +459,15 @@ class FactorBacktester:
                         "pnl_type": pnl_type,
                         "annual_return": annualized_return(values, self.config.annualization),
                         "sharpe": sharpe_ratio(values, self.config.annualization),
-                        "annual_limit_return": 0.0,
+                        "annual_limit_return": (
+                            annualized_return(daily[f"{pnl_type}_limit"].to_numpy(), self.config.annualization)
+                            if strategy == "equal_weight" and f"{pnl_type}_limit" in daily.columns
+                            else 0.0
+                        ),
                         "avg_turnover": (
                             safe_mean(daily["topk_power_lb_tvr"].to_numpy())
                             if strategy == "topk_power"
-                            else float("nan")
+                            else safe_mean(daily[f"{pnl_type}_tvr"].to_numpy())
                         ),
                         "max_drawdown": max_drawdown(values),
                     }

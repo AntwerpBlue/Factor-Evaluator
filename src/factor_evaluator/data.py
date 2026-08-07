@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 
@@ -6,7 +6,7 @@ import polars as pl
 
 
 DATE_ALIASES = ("date",)
-ASSET_ALIASES = ("code", "header")
+ASSET_ALIASES = ("asset", "code", "header")
 
 
 def _find_column(frame: pl.DataFrame, aliases: tuple[str, ...], label: str) -> str:
@@ -31,7 +31,7 @@ def normalize_panel(
         rename[asset_col] = "asset"
     result = frame.rename(rename).with_columns(
         pl.col("date").cast(pl.String),
-        pl.col("asset").cast(pl.String),
+        pl.col("asset").cast(pl.String).str.slice(0, 6),
     )
     invalid_dates = result.filter(~pl.col("date").str.contains(r"^\d{8}$")).height
     if invalid_dates:

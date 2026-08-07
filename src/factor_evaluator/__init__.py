@@ -1,4 +1,4 @@
-﻿"""Point-in-time safe factor and portfolio backtesting."""
+"""Point-in-time safe factor and portfolio backtesting."""
 
 from .data import FactorDataset, PortfolioDataset
 from .config import (
@@ -9,6 +9,16 @@ from .config import (
     load_target_weights,
 )
 from .factor import FactorBacktestConfig, FactorBacktestResult, FactorBacktester
+from .risk import (
+    ExposureMatrixProvider,
+    FactorCovarianceMatrix,
+    RiskMatrixProvider,
+    RiskModelEstimate,
+    estimate_factor_returns,
+    estimate_ewma_risk_model,
+    ewma_factor_covariance,
+    ewma_specific_risk,
+)
 from .portfolio import (
     IndexEnhancementConfig,
     IndexEnhancementStrategy,
@@ -33,5 +43,13 @@ __all__ = [
     "PortfolioBacktestConfig",
     "PortfolioBacktestResult",
     "PortfolioBacktester",
+    "ExposureMatrixProvider",
+    "FactorCovarianceMatrix",
+    "RiskMatrixProvider",
+    "RiskModelEstimate",
+    "estimate_factor_returns",
+    "estimate_ewma_risk_model",
+    "ewma_factor_covariance",
+    "ewma_specific_risk",
 ]
 

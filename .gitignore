@@ -5,3 +5,8 @@ __pycache__/
 synthetic_report/
 .tmp_doc_render/
 *.parquet
+
+backtest_results/
+.backtest_cache*/
+reports/
+config/wind_info.yaml
