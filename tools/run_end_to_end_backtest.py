@@ -452,6 +452,7 @@ def main() -> None:
             benchmark=factor_benchmark_returns,
             universe=universe,
             styles=styles,
+            limit_labels=load_frame(local_cache_dir / "tradability.parquet"),
         )
     )
     factor_files = export_factor_result_lenient(

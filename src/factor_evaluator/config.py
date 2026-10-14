@@ -87,6 +87,7 @@ def load_factor_dataset(config: BacktestFileConfig, benchmark: str) -> FactorDat
         benchmark=_benchmark_frame(config, benchmark, "returns"),
         universe=_optional_frame(config, "universe"),
         styles=_optional_frame(config, "style_exposures"),
+        limit_labels=_optional_frame(config, "tradability"),
     )
 
 

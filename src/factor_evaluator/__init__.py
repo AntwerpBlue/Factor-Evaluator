@@ -9,6 +9,11 @@ from .config import (
     load_target_weights,
 )
 from .factor import FactorBacktestConfig, FactorBacktestResult, FactorBacktester
+from .evaluation import (
+    FactorEvaluationConfig,
+    FactorEvaluationResult,
+    evaluate_factors,
+)
 from .risk import (
     ExposureMatrixProvider,
     FactorCovarianceMatrix,
@@ -38,6 +43,9 @@ __all__ = [
     "FactorBacktestConfig",
     "FactorBacktestResult",
     "FactorBacktester",
+    "FactorEvaluationConfig",
+    "FactorEvaluationResult",
+    "evaluate_factors",
     "IndexEnhancementConfig",
     "IndexEnhancementStrategy",
     "PortfolioBacktestConfig",

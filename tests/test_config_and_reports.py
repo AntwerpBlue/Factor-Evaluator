@@ -14,6 +14,7 @@ from factor_evaluator import (
     load_config,
 )
 from factor_evaluator.data import normalize_panel
+from factor_evaluator.config import BacktestFileConfig, load_factor_dataset
 
 
 def full_synthetic(n_dates: int = 24, n_assets: int = 10):
@@ -63,6 +64,45 @@ def test_input_contract_and_config_placeholder():
     config = load_config("config/backtest.example.toml")
     with pytest.raises(ValueError, match="placeholder"):
         config.resolve(config.paths["factor_values"])
+
+
+def test_factor_config_loads_tradability_mask(tmp_path):
+    factors = pl.DataFrame(
+        {"date": ["20250102"], "code": ["000001.SZ"], "alpha": [1.0]}
+    )
+    returns = pl.DataFrame(
+        {"date": ["20250102"], "code": ["000001.SZ"], "return": [0.01]}
+    )
+    benchmark = pl.DataFrame(
+        {"date": ["20250102"], "benchmark_return": [0.0]}
+    )
+    tradability = pl.DataFrame(
+        {"date": ["20250102"], "code": ["000001.SZ"], "limit_label": [1]}
+    )
+    for name, frame in {
+        "factors.parquet": factors,
+        "returns.parquet": returns,
+        "benchmark.parquet": benchmark,
+        "tradability.parquet": tradability,
+    }.items():
+        frame.write_parquet(tmp_path / name)
+
+    config = BacktestFileConfig(
+        path=tmp_path / "backtest.toml",
+        paths={
+            "factor_values": "factors.parquet",
+            "asset_forward_returns": "returns.parquet",
+            "tradability": "tradability.parquet",
+        },
+        benchmarks={"ZeroIndex": {"returns": "benchmark.parquet"}},
+        factor={},
+        portfolio={},
+        output={},
+    )
+
+    dataset = load_factor_dataset(config, "ZeroIndex").normalized()
+    assert dataset.limit_labels is not None
+    assert dataset.limit_labels["limit_label"].to_list() == [1]
 
 
 def test_full_factor_svg_contains_reference_panels(tmp_path):

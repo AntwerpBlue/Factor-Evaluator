@@ -11,6 +11,7 @@
 | `date` | 必须是 `YYYYMMDD` 格式的字符串 |
 | `code` 或 `header` | 6 位代码，或带交易所后缀的 9 位代码，如 `000001.SZ` |
 | 其余列 | 因子名称及数值；收益表使用 `return`，权重表使用 `weight` |
+| `limit_label` | 可选的涨跌停标记：`1` 涨停、`-1` 跌停、`0` 未触及涨跌停 |
 
 框架内部将 `code`/`header` 统一为 `asset`。非法日期、非法代码以及重复的 `date + code` 键会直接报错。
 
@@ -38,6 +39,44 @@ python examples/run_from_config.py
 - `{factor}_base.parquet`：LB、LS、IC、因子收益和 PowerRank 日序列
 - `result_all.parquet`：多因子合并日序列
 - SVG 4×4 综合报告：累计收益、年度收益、PowerRank、因子收益、分档收益、IC decay、覆盖率、分布、自相关、风格相关和四类分档风格暴露
+
+## Research Agent 稳定接口
+
+`evaluate_factors` 是供研究控制层调用的最小公开入口。它接收 Polars
+长表或 `.csv` / `.parquet` / `.ipc` / `.feather` / `.arrow` 路径，复用现有
+`FactorBacktester` 计算覆盖率、RankIC/ICIR 与因子自相关，并返回额外的
+Pearson IC、IC 稳定性和多因子截面相关性。前瞻收益仍遵守上面的时间契约，
+接口不会隐式 shift。
+
+```python
+from factor_evaluator import FactorEvaluationConfig, evaluate_factors
+
+result = evaluate_factors(
+    "artifacts/factor.parquet",
+    "data/forward_returns.parquet",
+    factor_names=["alpha"],
+    limit_labels="data/tradability.parquet",
+    config=FactorEvaluationConfig(min_assets=20, max_stability_lag=5),
+)
+
+# 适合 Experiment Artifact / Registry 的 JSON-safe 结构
+payload = result.to_dict()
+result.write_json("artifacts/evaluation.json")
+
+# 如需原框架的完整表格、日序列和报告导出
+result.backtest_result.export("artifacts/full_report", report_name="alpha")
+```
+
+稳定结果 schema 为 `factor-evaluation/v1`，顶层字段为 `data_quality`、
+`intrinsic`、`stability`、`correlations`、`daily_metrics` 和 `metadata`。
+未传 benchmark 时，intrinsic 评价会使用零收益 benchmark；这不影响
+IC/RankIC，但若调用完整多空报告，应显式传入真实 benchmark。
+
+累计收益图例中的第三个指标是涨跌停收益贡献：按当日组合权重汇总
+`limit_label != 0` 持仓的前瞻收益贡献。LB、LS 和 PowerRank LB 使用各自的
+实际权重。完整 mask 中没有涨跌停时该值为 `0`；未传 mask，或任一有效持仓
+缺少标记时显示 `n/a`，不会再把“未知”写成 `0`。该指标用于归因，不等同于
+涨跌停成交约束或不可交易情形下的替代 PnL 模拟。
 
 ## 组合输出
 

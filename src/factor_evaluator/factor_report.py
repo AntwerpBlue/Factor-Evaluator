@@ -81,6 +81,14 @@ def _return_label(summary: pl.DataFrame, factor: str, strategy: str, pnl_type: s
     sharpe = _metric_value(summary, factor, strategy, pnl_type, "sharpe")
     limit = _metric_value(summary, factor, strategy, pnl_type, "annual_limit_return")
     turnover = _metric_value(summary, factor, strategy, pnl_type, "avg_turnover")
+    is_net = name.endswith("net")
+    if is_net:
+        net_annual = _metric_value(summary, factor, strategy, pnl_type, "annual_return_net")
+        net_sharpe = _metric_value(summary, factor, strategy, pnl_type, "sharpe_net")
+        if net_annual is not None:
+            annual = net_annual
+        if net_sharpe is not None:
+            sharpe = net_sharpe
     return f"{factor}-{name}:{_fmt_pct(annual)}|{_fmt_num(sharpe)}|{_fmt_pct(limit)}|{_fmt_pct(None if turnover is None else 2.0 * turnover)}"
 
 
@@ -138,9 +146,15 @@ def write_factor_report(result: Any, path: Path) -> None:
 
     for factor, daily in result.daily.items():
         x = _date_axis(daily)
+        has_cost = float(result.metadata.get("cost_bps", 0.0) or 0.0) > 0.0
         panels[0].plot(x, np.cumsum(daily["lb"].fill_null(0).to_numpy()), label=_return_label(summary, factor, "equal_weight", "lb", "LB"))
         panels[0].plot(x, np.cumsum(daily["ls"].fill_null(0).to_numpy()), "--", label=_return_label(summary, factor, "equal_weight", "ls", "LS"))
+        if has_cost:
+            panels[0].plot(x, np.cumsum(daily["lb_net"].fill_null(0).to_numpy()), ":", label=_return_label(summary, factor, "equal_weight", "lb", "LBnet"))
+            panels[0].plot(x, np.cumsum(daily["ls_net"].fill_null(0).to_numpy()), ":", label=_return_label(summary, factor, "equal_weight", "ls", "LSnet"))
         panels[2].plot(x, np.cumsum(daily["topk_power_lb"].fill_null(0).to_numpy()), label=_return_label(summary, factor, "topk_power", "lb", "PowerLB"))
+        if has_cost and "topk_power_lb_net" in daily.columns:
+            panels[2].plot(x, np.cumsum(daily["topk_power_lb_net"].fill_null(0).to_numpy()), "--", label=_return_label(summary, factor, "topk_power", "lb", "PowerLBnet"))
         factor_summary = _table(result, "05_factor_return_summary")
         annual = _factor_summary_value(factor_summary, factor, "annual_return")
         sharpe = _factor_summary_value(factor_summary, factor, "sharpe")

@@ -39,6 +39,7 @@ class FactorBacktestConfig:
     test_basic_features: bool = True
     test_basic_return: bool = True
     test_style_features: bool = True
+    cost_bps: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0 < self.topk <= 1:
@@ -47,6 +48,8 @@ class FactorBacktestConfig:
             raise ValueError("buckets must be at least 2")
         if self.max_lag < 1:
             raise ValueError("max_lag must be positive")
+        if self.cost_bps < 0:
+            raise ValueError("cost_bps cannot be negative")
 
 
 @dataclass
@@ -149,6 +152,30 @@ class FactorBacktester:
         if not factor_columns:
             raise ValueError("No factor value columns found")
         joined = factors.join(returns.select("date", "asset", "return"), on=["date", "asset"])
+        if data.limit_labels is None:
+            joined = joined.with_columns(
+                pl.lit(None, dtype=pl.Int8).alias("limit_label")
+            )
+            limit_label_coverage = None
+            limit_label_hit_rate = None
+        else:
+            limit_labels = self._filter_dates(data.limit_labels)
+            joined = joined.join(
+                limit_labels.select("date", "asset", "limit_label"),
+                on=["date", "asset"],
+                how="left",
+            )
+            limit_label_coverage = float(
+                joined.select(pl.col("limit_label").is_not_null().mean()).item()
+            )
+            known_labels = joined.filter(pl.col("limit_label").is_not_null())
+            limit_label_hit_rate = (
+                float(
+                    known_labels.select((pl.col("limit_label") != 0).mean()).item()
+                )
+                if known_labels.height
+                else None
+            )
         benchmark_map = dict(benchmark.iter_rows())
         universe_counts = self._universe_counts(data, returns)
         table_rows: dict[str, list[dict[str, Any]]] = {
@@ -222,6 +249,14 @@ class FactorBacktester:
                 "topk": self.config.topk,
                 "power": self.config.power,
                 "annualization": self.config.annualization,
+                "cost_bps": self.config.cost_bps,
+                "limit_labels_supplied": data.limit_labels is not None,
+                "limit_label_coverage": limit_label_coverage,
+                "limit_label_hit_rate": limit_label_hit_rate,
+                "limit_contribution_definition": (
+                    "weighted forward-return contribution from positions whose "
+                    "observation-date limit_label is non-zero"
+                ),
             },
         )
 
@@ -258,14 +293,18 @@ class FactorBacktester:
         previous_weights: dict[str, float] = {}
         previous_lb_weights: dict[str, float] = {}
         previous_ls_weights: dict[str, float] = {}
-        clean = joined.select("date", "asset", factor, "return").drop_nulls([factor, "return"])
+        clean = joined.select(
+            "date", "asset", factor, "return", "limit_label"
+        ).drop_nulls([factor, "return"])
         for day in clean.partition_by("date", maintain_order=True):
             date = day["date"][0]
             signal = day[factor].to_numpy()
             asset_return = day["return"].to_numpy()
+            limit_label = day["limit_label"].cast(pl.Float64).to_numpy()
             assets = day["asset"].to_list()
             finite = np.isfinite(signal) & np.isfinite(asset_return)
             signal, asset_return = signal[finite], asset_return[finite]
+            limit_label = limit_label[finite]
             assets = [asset for asset, keep in zip(assets, finite) if keep]
             if signal.size < self.config.min_assets:
                 continue
@@ -323,22 +362,44 @@ class FactorBacktester:
             weights_by_date[date] = current_weights
             previous_weights = current_weights
             topk_return = float(np.dot(weights, asset_return))
+            lb_limit = self._limit_return_contribution(
+                lb_weights_array, asset_return, limit_label
+            )
+            ls_limit = self._limit_return_contribution(
+                ls_weights_array, asset_return, limit_label
+            )
+            topk_limit = self._limit_return_contribution(
+                weights, asset_return, limit_label
+            )
+            cost_rate = self.config.cost_bps / 10_000.0
+            lb_cost = 2.0 * lb_turnover * cost_rate
+            ls_cost = 2.0 * ls_turnover * cost_rate
+            topk_cost = 2.0 * turnover * cost_rate
+            lb_gross = long_return - bmk
+            ls_gross = long_return - short_return
+            topk_gross = topk_return - bmk
             rows.append(
                 {
                     "date": date,
-                    "lb": long_return - bmk,
-                    "ls": long_return - short_return,
+                    "lb": lb_gross,
+                    "ls": ls_gross,
                     "lb_tvr": lb_turnover,
                     "ls_tvr": ls_turnover,
-                    "lb_limit": 0.0,
-                    "ls_limit": 0.0,
+                    "lb_limit": lb_limit,
+                    "ls_limit": ls_limit,
                     "ic": rank_correlation(signal, asset_return),
                     "factor_return": factor_return,
-                    "topk_power_lb": topk_return - bmk,
+                    "topk_power_lb": topk_gross,
                     "topk_power_lb_tvr": turnover,
-                    "topk_power_lb_limit": 0.0,
+                    "topk_power_lb_limit": topk_limit,
                     "topk_power_long_return": topk_return,
                     "benchmark_return": bmk,
+                    "lb_net": lb_gross - lb_cost,
+                    "ls_net": ls_gross - ls_cost,
+                    "topk_power_lb_net": topk_gross - topk_cost,
+                    "lb_cost": lb_cost,
+                    "ls_cost": ls_cost,
+                    "topk_power_lb_cost": topk_cost,
                 }
             )
             for bucket_number in range(1, self.config.buckets + 1):
@@ -367,8 +428,41 @@ class FactorBacktester:
             "topk_power_lb_limit": pl.Float64,
             "topk_power_long_return": pl.Float64,
             "benchmark_return": pl.Float64,
+            "lb_net": pl.Float64,
+            "ls_net": pl.Float64,
+            "topk_power_lb_net": pl.Float64,
+            "lb_cost": pl.Float64,
+            "ls_cost": pl.Float64,
+            "topk_power_lb_cost": pl.Float64,
         }
         return pl.DataFrame(rows, schema=schema), weights_by_date, bucket_observations
+
+    @staticmethod
+    def _limit_return_contribution(
+        weights: np.ndarray,
+        asset_returns: np.ndarray,
+        limit_labels: np.ndarray,
+    ) -> float | None:
+        """Return the contribution from observation-date limit-hit positions.
+
+        Missing labels on positions with non-zero weight make the contribution
+        unknown.  This prevents a missing mask from being reported as a real
+        zero.  A complete mask with no limit-hit positions correctly returns
+        zero.
+        """
+
+        active = np.abs(weights) > 0
+        if not active.any():
+            return 0.0
+        active_labels = limit_labels[active]
+        if not np.isfinite(active_labels).all():
+            return None
+        limit_hit = active_labels != 0
+        if not limit_hit.any():
+            return 0.0
+        return float(
+            np.dot(weights[active][limit_hit], asset_returns[active][limit_hit])
+        )
 
     def _basic_tables(
         self,
@@ -451,6 +545,15 @@ class FactorBacktester:
                     continue
                 column = f"{prefix}{pnl_type}"
                 values = daily[column].to_numpy()
+                net_column = f"{column}_net"
+                net_values = daily[net_column].to_numpy() if net_column in daily.columns else values
+                cost_column = f"{column}_cost"
+                limit_column = f"{column}_limit"
+                limit_values = (
+                    daily[limit_column].to_numpy()
+                    if limit_column in daily.columns
+                    else np.asarray([], dtype=float)
+                )
                 tables["longshort_summary"].append(
                     {
                         "factor": factor,
@@ -458,18 +561,26 @@ class FactorBacktester:
                         "horizon": "base",
                         "pnl_type": pnl_type,
                         "annual_return": annualized_return(values, self.config.annualization),
+                        "annual_return_net": annualized_return(net_values, self.config.annualization),
                         "sharpe": sharpe_ratio(values, self.config.annualization),
+                        "sharpe_net": sharpe_ratio(net_values, self.config.annualization),
                         "annual_limit_return": (
-                            annualized_return(daily[f"{pnl_type}_limit"].to_numpy(), self.config.annualization)
-                            if strategy == "equal_weight" and f"{pnl_type}_limit" in daily.columns
-                            else 0.0
+                            annualized_return(limit_values, self.config.annualization)
+                            if limit_values.size and np.isfinite(limit_values).all()
+                            else float("nan")
                         ),
                         "avg_turnover": (
                             safe_mean(daily["topk_power_lb_tvr"].to_numpy())
                             if strategy == "topk_power"
                             else safe_mean(daily[f"{pnl_type}_tvr"].to_numpy())
                         ),
+                        "avg_cost": (
+                            safe_mean(daily[cost_column].to_numpy())
+                            if cost_column in daily.columns
+                            else 0.0
+                        ),
                         "max_drawdown": max_drawdown(values),
+                        "max_drawdown_net": max_drawdown(net_values),
                     }
                 )
             for year_frame in daily.with_columns(pl.col("date").str.slice(0, 4).alias("year")).partition_by("year"):
@@ -480,6 +591,11 @@ class FactorBacktester:
                         "strategy": strategy,
                         "year": int(year_frame["year"][0]),
                         "annual_lb_return": float(year_frame[f"{prefix}lb"].sum()),
+                        "annual_lb_return_net": (
+                            float(year_frame[f"{prefix}lb_net"].sum())
+                            if f"{prefix}lb_net" in year_frame.columns
+                            else float(year_frame[f"{prefix}lb"].sum())
+                        ),
                     }
                 )
         factor_returns = daily["factor_return"].to_numpy()

@@ -92,6 +92,7 @@ class FactorDataset:
     benchmark: pl.DataFrame
     universe: pl.DataFrame | None = None
     styles: pl.DataFrame | None = None
+    limit_labels: pl.DataFrame | None = None
 
     def normalized(self) -> "FactorDataset":
         factors = normalize_panel(self.factors)
@@ -105,7 +106,33 @@ class FactorDataset:
         benchmark = normalize_daily(self.benchmark, "benchmark_return")
         universe = normalize_panel(self.universe) if self.universe is not None else None
         styles = normalize_panel(self.styles) if self.styles is not None else None
-        return FactorDataset(factors, returns, benchmark, universe, styles)
+        limit_labels = None
+        if self.limit_labels is not None:
+            normalized_labels = normalize_panel(self.limit_labels)
+            if "limit_label" not in normalized_labels.columns:
+                raise ValueError("limit_labels must contain a 'limit_label' column")
+            limit_labels = normalized_labels.select(
+                "date",
+                "asset",
+                pl.col("limit_label").cast(pl.Int8, strict=True),
+            )
+            invalid_labels = limit_labels.filter(
+                pl.col("limit_label").is_not_null()
+                & ~pl.col("limit_label").is_in([-1, 0, 1])
+            ).height
+            if invalid_labels:
+                raise ValueError(
+                    "limit_labels contains values outside {-1, 0, 1}: "
+                    f"{invalid_labels} rows"
+                )
+        return FactorDataset(
+            factors=factors,
+            returns=returns,
+            benchmark=benchmark,
+            universe=universe,
+            styles=styles,
+            limit_labels=limit_labels,
+        )
 
 
 @dataclass(frozen=True)
