@@ -10,3 +10,6 @@ backtest_results/
 .backtest_cache*/
 reports/
 config/wind_info.yaml
+
+# Local editor settings
+.vscode/
