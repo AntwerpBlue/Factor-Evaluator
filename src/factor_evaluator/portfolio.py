@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 from scipy.optimize import linprog, minimize
+from scipy import sparse
 
 from .data import PortfolioDataset, normalize_panel
 from .metrics import annualized_return, annualized_volatility, safe_mean, sharpe_ratio
@@ -35,6 +36,29 @@ class IndexEnhancementConfig:
     alpha_transform: Literal["none", "zscore", "rank_zscore"] = "zscore"
     alpha_scale: float = 1.0
     alpha_clip: float | None = 5.0
+    alpha_return_scale: float | None = None
+    risk_annualization: float = 252.0
+    exposure_bounds: Mapping[str, tuple[float, float]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AssetConstraints:
+    """Weight restrictions at one rebalance; all bounds are intersected."""
+
+    weight_bounds: Mapping[str, tuple[float, float]] = field(default_factory=dict)
+    allowed_assets: set[str] | None = None
+    frozen: Sequence[str] = ()
+    no_buy: Sequence[str] = ()
+    no_sell: Sequence[str] = ()
+
+    def assets(self) -> set[str]:
+        return set(self.weight_bounds) | set(self.allowed_assets or ()) | set(self.frozen) | set(self.no_buy) | set(self.no_sell)
+
+
+@dataclass
+class OptimizationResult:
+    weights: dict[str, float]
+    diagnostics: dict[str, Any]
 
 
 class IndexEnhancementStrategy:
@@ -47,6 +71,7 @@ class IndexEnhancementStrategy:
 
     def __init__(self, config: IndexEnhancementConfig | None = None):
         self.config = config or IndexEnhancementConfig()
+        self.diagnostics: list[dict[str, Any]] = []
 
     def optimize(
         self,
@@ -56,8 +81,35 @@ class IndexEnhancementStrategy:
         covariance: np.ndarray | None = None,
         assets: Sequence[str] | None = None,
         exposure_matrix: np.ndarray | None = None,
+        *,
+        exposure_names: Sequence[str] | None = None,
+        asset_constraints: AssetConstraints | None = None,
     ) -> dict[str, float]:
-        assets = list(assets) if assets is not None else sorted(set(alpha) | set(benchmark_weights))
+        """Optimize already prepared, per-period expected returns; return weights only.
+
+        Alpha preprocessing options apply to build_targets, not this low-level API.
+        Covariance uses the same period as alpha; tracking_error is annualized.
+        """
+        return self.optimize_result(
+            alpha, benchmark_weights, previous_weights, covariance, assets, exposure_matrix,
+            exposure_names=exposure_names, asset_constraints=asset_constraints,
+        ).weights
+
+    def optimize_result(
+        self,
+        alpha: Mapping[str, float],
+        benchmark_weights: Mapping[str, float],
+        previous_weights: Mapping[str, float] | None = None,
+        covariance: np.ndarray | None = None,
+        assets: Sequence[str] | None = None,
+        exposure_matrix: np.ndarray | None = None,
+        *,
+        alpha_units: Literal["return", "score"] = "return",
+        exposure_names: Sequence[str] | None = None,
+        asset_constraints: AssetConstraints | None = None,
+    ) -> OptimizationResult:
+        restrictions = asset_constraints or AssetConstraints()
+        assets = list(assets) if assets is not None else sorted(set(alpha) | set(benchmark_weights) | set(previous_weights or {}) | restrictions.assets())
         missing_assets = (set(alpha) | set(benchmark_weights)) - set(assets)
         if missing_assets:
             raise ValueError("assets must include all alpha and benchmark names")
@@ -92,7 +144,8 @@ class IndexEnhancementStrategy:
             previous = np.full(len(assets), 1.0 / len(assets))
         else:
             previous = benchmark.copy()
-        if covariance is None and self.config.require_covariance:
+        risk_source = "provided" if covariance is not None else "identity_regularizer"
+        if covariance is None and (self.config.require_covariance or self.config.tracking_error is not None):
             raise ValueError(
                 "Risk covariance is required but missing for the optimization date"
             )
@@ -101,17 +154,34 @@ class IndexEnhancementStrategy:
             covariance = np.asarray(covariance, dtype=float)
         if covariance.shape != (len(assets), len(assets)):
             raise ValueError("covariance shape does not match optimizer universe")
+        if exposure_matrix is None and (self.config.active_exposure_penalty > 0 or self.config.active_exposure_limit is not None or self.config.exposure_bounds):
+            raise ValueError("Exposure controls require an exposure matrix for the optimization date")
+        if alpha_units == "score" and self.config.turnover_cost_alpha_fraction is not None:
+            raise ValueError("Cost/alpha constraint requires expected returns; set alpha_return_scale or use alpha_transform='none'")
         exposure_matrix = (
             np.asarray(exposure_matrix, dtype=float)
             if exposure_matrix is not None
             and (
                 self.config.active_exposure_penalty > 0
                 or self.config.active_exposure_limit is not None
+                or self.config.exposure_bounds
             )
             else None
         )
         if exposure_matrix is not None and exposure_matrix.shape[0] != len(assets):
             raise ValueError("exposure_matrix rows must match optimizer universe")
+
+        names = list(exposure_names) if exposure_names is not None else [str(i) for i in range(exposure_matrix.shape[1] if exposure_matrix is not None else 0)]
+        exposure_lower = np.full(len(names), -np.inf)
+        exposure_upper = np.full(len(names), np.inf)
+        if self.config.active_exposure_limit is not None:
+            exposure_lower[:] = -self.config.active_exposure_limit
+            exposure_upper[:] = self.config.active_exposure_limit
+        for name, (lo, hi) in self.config.exposure_bounds.items():
+            index = names.index(name)
+            exposure_lower[index] = max(exposure_lower[index], lo)
+            exposure_upper[index] = min(exposure_upper[index], hi)
+        has_exposure_bounds = bool(self.config.exposure_bounds) or self.config.active_exposure_limit is not None
 
         cost_rate = self.config.turnover_cost_bps / 10_000.0
 
@@ -186,22 +256,47 @@ class IndexEnhancementStrategy:
                 raise ValueError("max_trade_weight must be positive")
             lower = np.maximum(lower, previous - max_trade_weight)
             upper = np.minimum(upper, previous + max_trade_weight)
-        if lower.sum() > 1.0 or upper.sum() < 1.0:
-            raise ValueError("Weight bounds are infeasible; relax max_weight/max_active_weight")
+        if (restrictions.frozen or restrictions.no_buy or restrictions.no_sell) and previous_weights is None:
+            raise ValueError("Frozen/no-buy/no-sell restrictions require current holdings")
+        positions = {asset: i for i, asset in enumerate(assets)}
+        for asset, (lo, hi) in restrictions.weight_bounds.items():
+            i = positions[asset]
+            lower[i], upper[i] = max(lower[i], lo), min(upper[i], hi)
+        if restrictions.allowed_assets is not None:
+            for i, asset in enumerate(assets):
+                if asset not in restrictions.allowed_assets:
+                    lower[i], upper[i] = max(lower[i], 0.0), min(upper[i], 0.0)
+        for asset in restrictions.frozen:
+            i = positions[asset]
+            lower[i], upper[i] = max(lower[i], previous[i]), min(upper[i], previous[i])
+        for asset in restrictions.no_buy:
+            i = positions[asset]
+            upper[i] = min(upper[i], previous[i])
+        for asset in restrictions.no_sell:
+            i = positions[asset]
+            lower[i] = max(lower[i], previous[i])
+        if np.any(lower > upper) or lower.sum() > 1.0 or upper.sum() < 1.0:
+            conflicts = [asset for asset, lo, hi in zip(assets, lower, upper) if lo > hi]
+            raise ValueError(f"Weight bounds are infeasible; conflicting assets={conflicts}, sum(lower)={lower.sum():.6g}, sum(upper)={upper.sum():.6g}")
         constraints: list[dict[str, Any]] = [
             {"type": "eq", "fun": lambda weight: float(weight.sum() - 1.0)}
         ]
-        if exposure_matrix is not None and self.config.active_exposure_limit is not None:
-            exposure_limit = float(self.config.active_exposure_limit)
-            if exposure_limit <= 0:
-                raise ValueError("active_exposure_limit must be positive")
-            constraints.append(
-                {
-                    "type": "ineq",
-                    "fun": lambda weight: exposure_limit
-                    - np.abs(exposure_matrix.T @ (weight - benchmark)),
-                }
-            )
+        if has_exposure_bounds:
+            # Keep exact neutrality as equality constraints, including zero bands.
+            equality = exposure_lower == exposure_upper
+            lo_mask = np.isfinite(exposure_lower) & ~equality
+            hi_mask = np.isfinite(exposure_upper) & ~equality
+            for mask, kind, sign, bound in (
+                (equality, "eq", 1, exposure_lower),
+                (lo_mask, "ineq", 1, exposure_lower),
+                (hi_mask, "ineq", -1, exposure_upper),
+            ):
+                if np.any(mask):
+                    matrix = sign * exposure_matrix[:, mask].T
+                    offset = sign * bound[mask] + matrix @ benchmark
+                    constraints.append({"type": kind,
+                        "fun": lambda weight, m=matrix, b=offset: m @ weight - b,
+                        "jac": lambda weight, m=matrix: m})
         initial = self._project_box_simplex(benchmark, lower, upper)
         max_turnover = None
         if self.config.max_turnover is not None:
@@ -213,10 +308,53 @@ class IndexEnhancementStrategy:
             self.config.risk_aversion == 0
             and self.config.turnover_penalty == 0
             and self.config.active_exposure_penalty == 0
-            and self.config.active_exposure_limit is None
             and self.config.tracking_error is None
-            and self.config.turnover_cost_alpha_fraction is None
         )
+        def finish(solution: np.ndarray, solver: str, status: str) -> OptimizationResult:
+            # Only evaluate the produced portfolio; no input scans or matrix audits.
+            active = solution - benchmark
+            delta = solution - previous
+            turnover = one_way_turnover(solution)
+            cost = turnover_cost(solution)
+            gain = expected_alpha_gain(solution)
+            active_variance = self._risk_quadratic(covariance, active)
+            annual_te = float(np.sqrt(max(active_variance, 0.0) * self.config.risk_annualization))
+            exposures = exposure_matrix.T @ active if exposure_matrix is not None else np.array([])
+            slack = {
+                "weight_sum": 1e-6 - abs(float(solution.sum()) - 1.0),
+                "lower_weight": float(np.min(solution - lower)),
+                "upper_weight": float(np.min(upper - solution)),
+            }
+            if max_turnover is not None:
+                slack["turnover"] = max_turnover - turnover
+            if self.config.tracking_error is not None:
+                slack["tracking_error_annual"] = self.config.tracking_error - annual_te
+            for i, name in enumerate(names):
+                if np.isfinite(exposure_lower[i]):
+                    slack[f"exposure:{name}:lower"] = float(exposures[i] - exposure_lower[i])
+                if np.isfinite(exposure_upper[i]):
+                    slack[f"exposure:{name}:upper"] = float(exposure_upper[i] - exposures[i])
+            if self.config.turnover_cost_alpha_fraction is not None:
+                slack["cost_alpha"] = self.config.turnover_cost_alpha_fraction * gain - cost
+            violations = [name for name, value in slack.items() if not np.isfinite(value) or value < -1e-7]
+            if not np.isfinite(solution).all() or violations:
+                raise RuntimeError(f"Optimizer produced unusable weights: {violations}; constraint slacks={slack}")
+            return OptimizationResult(dict(zip(assets, map(float, solution))), {
+                "solver": solver, "solver_status": status, "constraints_satisfied": True,
+                "constraint_slacks": slack, "alpha_units": alpha_units,
+                "expected_alpha": float(expected @ solution),
+                "expected_active_alpha": float(expected @ active),
+                "expected_alpha_gain": gain, "expected_cost": cost,
+                "turnover": turnover, "max_trade_weight": float(np.max(np.abs(delta))),
+                "weight_sum": float(solution.sum()), "gross_weight": float(np.abs(solution).sum()),
+                "max_weight": float(np.max(solution)), "max_active_weight": float(np.max(np.abs(active))),
+                "active_exposures": exposures.tolist(), "risk_source": risk_source,
+                "named_active_exposures": dict(zip(names, exposures.tolist())),
+                "risk_annualization": self.config.risk_annualization,
+                "tracking_error_annual": annual_te if risk_source == "provided" else None,
+                "volatility_annual": float(np.sqrt(max(self._risk_quadratic(covariance, solution), 0.0) * self.config.risk_annualization)) if risk_source == "provided" else None,
+            })
+
         if use_linear_program:
             solution = self._linear_optimize(
                 expected,
@@ -225,24 +363,21 @@ class IndexEnhancementStrategy:
                 lower,
                 upper,
                 exposure_matrix,
-            )
-            solution = self._apply_turnover_cap(solution, previous, max_turnover)
-            solution = self._apply_turnover_alpha_fraction(
-                solution,
-                previous,
-                expected,
-                lower,
-                upper,
+                max_turnover,
                 self.config.turnover_cost_alpha_fraction,
                 cost_rate,
+                exposure_lower,
+                exposure_upper,
             )
-            return dict(zip(assets, solution))
+            return finish(solution, "highs", "converged")
         use_slsqp = (
             self.config.tracking_error is not None
-            or self.config.active_exposure_limit is not None
+            or has_exposure_bounds
+            or max_turnover is not None
+            or self.config.turnover_cost_alpha_fraction is not None
         )
         if not use_slsqp:
-            solution = self._projected_gradient_optimize(
+            solution, status = self._projected_gradient_optimize(
                 initial,
                 lower,
                 upper,
@@ -250,17 +385,7 @@ class IndexEnhancementStrategy:
                 objective_jac,
                 covariance,
             )
-            solution = self._apply_turnover_cap(solution, previous, max_turnover)
-            solution = self._apply_turnover_alpha_fraction(
-                solution,
-                previous,
-                expected,
-                lower,
-                upper,
-                self.config.turnover_cost_alpha_fraction,
-                cost_rate,
-            )
-            return dict(zip(assets, solution))
+            return finish(solution, "projected_gradient", status)
 
         if self.config.tracking_error is not None:
             constraints.append(
@@ -268,9 +393,9 @@ class IndexEnhancementStrategy:
                     "type": "ineq",
                     "fun": lambda weight: float(
                         self.config.tracking_error**2
-                        - self._risk_quadratic(covariance, weight - benchmark)
+                        - self.config.risk_annualization * self._risk_quadratic(covariance, weight - benchmark)
                     ),
-                    "jac": lambda weight: -2.0 * self._risk_matvec(covariance, weight - benchmark),
+                    "jac": lambda weight: -2.0 * self.config.risk_annualization * self._risk_matvec(covariance, weight - benchmark),
                 }
             )
         if use_slsqp and self.config.turnover_cost_alpha_fraction is not None:
@@ -305,61 +430,7 @@ class IndexEnhancementStrategy:
         )
         if not result.success:
             raise RuntimeError(f"Index enhancement optimization failed: {result.message}")
-        solution = self._apply_turnover_cap(result.x, previous, max_turnover)
-        solution = self._apply_turnover_alpha_fraction(
-            solution, previous, expected, lower, upper, self.config.turnover_cost_alpha_fraction, cost_rate
-        )
-        return dict(zip(assets, solution))
-
-    @staticmethod
-    def _apply_turnover_cap(
-        solution: np.ndarray,
-        previous: np.ndarray,
-        max_turnover: float | None,
-    ) -> np.ndarray:
-        if max_turnover is None:
-            return solution
-        turnover = 0.5 * float(np.abs(solution - previous).sum())
-        if turnover <= max_turnover + 1e-12:
-            return solution
-        scale = max_turnover / turnover
-        return previous + scale * (solution - previous)
-
-    @classmethod
-    def _apply_turnover_alpha_fraction(
-        cls,
-        solution: np.ndarray,
-        previous: np.ndarray,
-        expected: np.ndarray,
-        lower: np.ndarray,
-        upper: np.ndarray,
-        fraction: float | None,
-        cost_rate: float,
-    ) -> np.ndarray:
-        if fraction is None:
-            return solution
-        if fraction <= 0:
-            raise ValueError("turnover_cost_alpha_fraction must be positive")
-        if cls._turnover_alpha_fraction_ok(solution, previous, expected, fraction, cost_rate):
-            return solution
-        fallback = cls._project_box_simplex(previous, lower, upper)
-        return fallback
-
-    @staticmethod
-    def _turnover_alpha_fraction_ok(
-        weight: np.ndarray,
-        previous: np.ndarray,
-        expected: np.ndarray,
-        fraction: float,
-        cost_rate: float,
-    ) -> bool:
-        delta = weight - previous
-        traded = float(np.abs(delta).sum())
-        if traded <= 1e-12:
-            return True
-        cost = cost_rate * traded
-        alpha_gain = float(expected @ delta)
-        return alpha_gain > 0 and cost <= fraction * alpha_gain + 1e-12
+        return finish(result.x, "SLSQP", str(result.message))
 
     @staticmethod
     def _risk_matvec(covariance: Any, value: np.ndarray) -> np.ndarray:
@@ -392,18 +463,62 @@ class IndexEnhancementStrategy:
         lower: np.ndarray,
         upper: np.ndarray,
         exposure_matrix: np.ndarray | None,
+        max_turnover: float | None = None,
+        cost_fraction: float | None = None,
+        cost_rate: float = 0.0,
+        exposure_lower: np.ndarray | None = None,
+        exposure_upper: np.ndarray | None = None,
     ) -> np.ndarray:
-        del benchmark, previous, exposure_matrix
+        n = expected.size
+        extended = max_turnover is not None or cost_fraction is not None
+        c = -expected
+        bounds = list(zip(lower, upper))
+        a_eq = np.ones((1, n))
+        b_eq = np.asarray([1.0])
+        a_ub, b_ub = None, None
+        if extended:
+            # u >= abs(w - previous), with sparse blocks for large universes.
+            identity = sparse.eye(n, format="csr")
+            blocks = [sparse.hstack([identity, -identity]), sparse.hstack([-identity, -identity])]
+            limits = [previous, -previous]
+            if max_turnover is not None:
+                blocks.append(sparse.csr_matrix(np.r_[np.zeros(n), np.full(n, 0.5)][None, :]))
+                limits.append(np.array([max_turnover]))
+            if cost_fraction is not None:
+                blocks.append(sparse.csr_matrix(np.r_[-cost_fraction * expected, np.full(n, cost_rate)][None, :]))
+                limits.append(np.array([-cost_fraction * float(expected @ previous)]))
+            a_ub = sparse.vstack(blocks, format="csr")
+            b_ub = np.concatenate(limits)
+            c = np.r_[-expected, np.zeros(n)]
+            a_eq = sparse.csr_matrix(np.r_[np.ones(n), np.zeros(n)][None, :])
+            bounds += [(0.0, None)] * n
+        if exposure_matrix is not None:
+            matrix = sparse.csr_matrix(exposure_matrix.T)
+            if extended:
+                matrix = sparse.hstack([matrix, sparse.csr_matrix((matrix.shape[0], n))], format="csr")
+            benchmark_exposure = exposure_matrix.T @ benchmark
+            equality = exposure_lower == exposure_upper
+            if np.any(equality):
+                a_eq = sparse.vstack([sparse.csr_matrix(a_eq), matrix[equality]], format="csr")
+                b_eq = np.r_[b_eq, exposure_lower[equality] + benchmark_exposure[equality]]
+            lo_mask = np.isfinite(exposure_lower) & ~equality
+            hi_mask = np.isfinite(exposure_upper) & ~equality
+            if np.any(lo_mask) or np.any(hi_mask):
+                exposure_a = sparse.vstack([-matrix[lo_mask], matrix[hi_mask]], format="csr")
+                exposure_b = np.r_[-exposure_lower[lo_mask] - benchmark_exposure[lo_mask], exposure_upper[hi_mask] + benchmark_exposure[hi_mask]]
+                a_ub = sparse.vstack([a_ub, exposure_a], format="csr") if a_ub is not None else exposure_a
+                b_ub = np.r_[b_ub, exposure_b] if b_ub is not None else exposure_b
         result = linprog(
-            -expected,
-            A_eq=np.ones((1, expected.size)),
-            b_eq=np.asarray([1.0]),
-            bounds=list(zip(lower, upper)),
+            c,
+            A_ub=a_ub, b_ub=b_ub,
+            A_eq=a_eq,
+            b_eq=b_eq,
+            bounds=bounds,
             method="highs",
         )
         if not result.success:
             raise RuntimeError(f"Index enhancement linear optimization failed: {result.message}")
-        return np.asarray(result.x, dtype=float)
+        return np.asarray(result.x[:n], dtype=float)
 
     @staticmethod
     def _project_box_simplex(
@@ -446,7 +561,7 @@ class IndexEnhancementStrategy:
         *,
         max_iter: int = 500,
         tolerance: float = 1e-9,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, str]:
         weight = initial.copy()
         spectral = cls._risk_spectral_bound(covariance)
         step = 1.0 / max(2.0 * spectral + 1e-3, 1e-3)
@@ -459,20 +574,20 @@ class IndexEnhancementStrategy:
                 candidate = cls._project_box_simplex(weight - local_step * gradient, lower, upper)
                 direction = candidate - weight
                 if np.linalg.norm(direction, ord=1) < tolerance:
-                    return candidate
+                    return candidate, "converged"
                 candidate_value = objective(candidate)
                 if candidate_value <= value + 1e-4 * float(gradient @ direction):
                     accepted = True
                     break
                 local_step *= 0.5
             if not accepted:
-                return weight
+                return weight, "line_search_stopped"
             if abs(value - candidate_value) < tolerance:
-                return candidate
+                return candidate, "converged"
             weight = candidate
             value = candidate_value
             step = min(local_step * 1.2, 10.0)
-        return weight
+        return weight, "iteration_limit"
 
     def build_targets(
         self,
@@ -481,7 +596,11 @@ class IndexEnhancementStrategy:
         covariance_by_date: Mapping[str, np.ndarray] | Callable[[str, list[str]], np.ndarray | None] | None = None,
         exposure_by_date: Callable[[str, list[str]], np.ndarray | None] | None = None,
         asset_returns: pl.DataFrame | None = None,
+        initial_weights: Mapping[str, float] | None = None,
+        asset_constraints_by_date: Mapping[str, AssetConstraints] | Callable[[str], AssetConstraints] | None = None,
+        exposure_names: Sequence[str] | None = None,
     ) -> pl.DataFrame:
+        self.diagnostics = []
         signal_panel = normalize_panel(signals)
         benchmark_panel = normalize_panel(benchmark_weights)
         returns_panel = normalize_panel(asset_returns) if asset_returns is not None else None
@@ -509,7 +628,7 @@ class IndexEnhancementStrategy:
                 for day in returns_panel.partition_by("date", maintain_order=True)
             }
         rows = []
-        previous: dict[str, float] | None = None
+        previous = dict(initial_weights) if initial_weights is not None else None
         previous_date: str | None = None
         for date in sorted(set(signal_dates) & set(benchmark_dates)):
             previous_for_opt = previous
@@ -527,20 +646,34 @@ class IndexEnhancementStrategy:
                     / denominator
                     for asset in assets_for_drift
                 }
-            assets = sorted(set(signal_dates[date]) | set(benchmark_dates[date]) | set(previous_for_opt or {}))
+            restrictions = (
+                asset_constraints_by_date(date) if callable(asset_constraints_by_date)
+                else asset_constraints_by_date[date] if asset_constraints_by_date is not None
+                else AssetConstraints()
+            )
+            assets = sorted(set(signal_dates[date]) | set(benchmark_dates[date]) | set(previous_for_opt or {}) | restrictions.assets())
             if callable(covariance_by_date):
                 covariance = covariance_by_date(date, assets)
             else:
                 covariance = (covariance_by_date or {}).get(date)
             exposure_matrix = exposure_by_date(date, assets) if exposure_by_date is not None else None
-            weights = self.optimize(
+            if covariance is None and covariance_by_date is not None:
+                raise ValueError(f"Risk covariance unavailable on {date}")
+            if exposure_matrix is None and exposure_by_date is not None:
+                raise ValueError(f"Risk exposures unavailable on {date}")
+            result = self.optimize_result(
                 signal_dates[date],
                 benchmark_dates[date],
                 previous_for_opt,
                 covariance,
                 assets=assets,
                 exposure_matrix=exposure_matrix,
+                alpha_units="return" if self.config.alpha_transform == "none" or self.config.alpha_return_scale is not None else "score",
+                exposure_names=exposure_names if exposure_names is not None else getattr(exposure_by_date, "exposure_columns", None),
+                asset_constraints=restrictions,
             )
+            weights = result.weights
+            self.diagnostics.append({"date": date, **result.diagnostics})
             rows.extend(
                 {"date": date, "asset": asset, "weight": weight}
                 for asset, weight in weights.items()
@@ -578,6 +711,8 @@ class IndexEnhancementStrategy:
             if clip <= 0:
                 raise ValueError("alpha_clip must be positive")
             transformed = np.clip(transformed, -clip, clip)
+        if self.config.alpha_return_scale is not None:
+            transformed *= self.config.alpha_return_scale
         return dict(zip(assets, transformed))
 
 

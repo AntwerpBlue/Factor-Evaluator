@@ -357,7 +357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--risk-aversion", type=float, default=5.0)
     parser.add_argument("--turnover-penalty", type=float, default=0.02)
     parser.add_argument("--turnover-cost-bps", type=float, default=8.0)
-    parser.add_argument("--turnover-cost-alpha-fraction", type=float, default=0.9, help="PF soft turnover gate: require turnover cost <= fraction * expected alpha improvement; set <=0 to disable.")
+    parser.add_argument("--turnover-cost-alpha-fraction", type=float, default=0.0, help="Cost/return constraint; use alpha-transform none with expected returns. Default disabled.")
     parser.add_argument("--max-daily-turnover", type=float, help="Hard cap for daily one-way turnover, e.g. 0.05 means 5%%.")
     parser.add_argument(
         "--annual-turnover-target",
@@ -367,7 +367,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-weight", type=float, default=0.03)
     parser.add_argument("--max-active-weight", type=float, default=0.01)
-    parser.add_argument("--tracking-error", type=float)
+    parser.add_argument("--tracking-error", type=float, help="Annualized tracking error, using 252 daily covariance periods per year.")
     parser.add_argument("--risk-halflife", type=float, default=63.0)
     parser.add_argument("--risk-min-periods", type=int, default=60)
     parser.add_argument("--factor-buckets", type=int, default=30)

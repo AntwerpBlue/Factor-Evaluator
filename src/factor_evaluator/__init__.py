@@ -25,8 +25,10 @@ from .risk import (
     ewma_specific_risk,
 )
 from .portfolio import (
+    AssetConstraints,
     IndexEnhancementConfig,
     IndexEnhancementStrategy,
+    OptimizationResult,
     PortfolioBacktestConfig,
     PortfolioBacktestResult,
     PortfolioBacktester,
@@ -48,6 +50,8 @@ __all__ = [
     "evaluate_factors",
     "IndexEnhancementConfig",
     "IndexEnhancementStrategy",
+    "OptimizationResult",
+    "AssetConstraints",
     "PortfolioBacktestConfig",
     "PortfolioBacktestResult",
     "PortfolioBacktester",

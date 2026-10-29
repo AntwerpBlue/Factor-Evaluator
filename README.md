@@ -40,6 +40,8 @@ python run_backtest.py factor --factor data/factors.parquet --forward-returns da
 
 ## 数据协议
 
+独立输出组合权重使用 `python run_backtest.py build-targets --help`。优化器单位、持仓输入与诊断输出见 [组合优化器](docs/optimizer.md)。
+
 | 数据 | 必需字段 |
 |---|---|
 | 因子长表 | `date`、证券代码、一个或多个因子值列 |
