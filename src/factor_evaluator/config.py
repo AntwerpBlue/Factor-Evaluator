@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
 import os
@@ -58,7 +58,9 @@ def load_frame(path: Path) -> pl.DataFrame:
     if suffix in {".parquet", ".pq"}:
         return pl.read_parquet(path)
     if suffix == ".csv":
-        return pl.read_csv(path, try_parse_dates=True)
+        return pl.read_csv(path, schema_overrides={
+            name: pl.String for name in ("date", "Date", "asset", "code", "Code", "header")
+        })
     if suffix in {".ipc", ".feather", ".arrow"}:
         return pl.read_ipc(path)
     raise ValueError(f"Unsupported data file format: {path}")

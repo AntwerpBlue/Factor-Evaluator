@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Fetch benchmark index returns and constituent weights from the local Wind DB.
 
@@ -32,8 +31,6 @@ from pathlib import Path
 from typing import Iterable
 
 import polars as pl
-import yaml
-from sqlalchemy import create_engine, text
 
 
 LOGGER = logging.getLogger("fetch_wind_index_data")
@@ -83,6 +80,8 @@ class FetchPlan:
 
 
 def load_config(path: str | Path) -> dict:
+    import yaml
+
     path = Path(path).expanduser()
     if not path.exists():
         raise FileNotFoundError(path)
@@ -91,6 +90,8 @@ def load_config(path: str | Path) -> dict:
 
 
 def sql_engine(db_cfg: dict):
+    from sqlalchemy import create_engine
+
     driver = "ODBC Driver 18 for SQL Server"
     server = db_cfg["server"]
     database = db_cfg["database"]
@@ -274,6 +275,8 @@ def build_fetch_plans(
 
 
 def fetch_index_prices(engine, codes: dict[str, str], dates: DateRange) -> pl.DataFrame:
+    from sqlalchemy import text
+
     query = f"""
         SELECT S_INFO_WINDCODE, TRADE_DT, S_DQ_CLOSE, S_DQ_PCTCHANGE
         FROM WINDFILESYNC.dbo.{INDEX_EOD_TABLE}
@@ -332,6 +335,8 @@ def build_benchmark_returns(
 
 
 def fetch_raw_weights(engine, codes: dict[str, str], end_date: str) -> pl.DataFrame:
+    from sqlalchemy import text
+
     # Pull all available snapshots up to end_date so the first requested day can
     # be filled from the latest earlier Wind weight snapshot.
     query = f"""
@@ -455,7 +460,7 @@ def write_outputs(
     LOGGER.info("Wrote %s (%s rows)", paths.weights, weights.height)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch Wind benchmark returns and index constituent weights."
     )
@@ -485,12 +490,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rebuild selected output files instead of appending only missing dates.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
 
     config = load_config(args.config)
     trading_days = read_calendar(args.calendar)
@@ -540,7 +545,3 @@ def main() -> None:
         returns = merge_returns(plan.existing_returns, new_returns)
         weights = merge_weights(plan.existing_weights, new_weights)
         write_outputs(output_dir, plan.key, returns, weights)
-
-
-if __name__ == "__main__":
-    main()

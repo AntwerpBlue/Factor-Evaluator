@@ -41,12 +41,13 @@ weights = "REPLACE_ME/benchmark_2000_weights.parquet"
 [factor]
 start_date = "20200101"
 end_date = "20251231"
-out_of_sample_start = "20250101"
-single_interval = true
+# Legacy split-period fields are not implemented as a comparison report.
+# Use separate date ranges for in-sample and out-of-sample runs.
 buckets = 30
 topk = 1.0
 power = 2.0
 annualization = 252
+cost_bps = 0.0
 max_lag = 10
 min_assets = 20
 test_basic_features = true

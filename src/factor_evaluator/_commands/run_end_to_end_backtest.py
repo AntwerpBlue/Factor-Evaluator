@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run end-to-end factor and index-enhancement portfolio backtests.
 
 The script keeps reusable intermediate parquet files under cache-root/local,
@@ -20,10 +19,9 @@ from pathlib import Path
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+ROOT = Path(__file__).resolve().parents[3]
 
-from factor_evaluator import (  # noqa: E402
+from factor_evaluator import (
     FactorBacktestConfig,
     FactorBacktester,
     FactorDataset,
@@ -73,7 +71,7 @@ def expand(path: str | Path) -> Path:
 
 def run_command(command: list[str]) -> None:
     LOGGER.info("Running: %s", " ".join(command))
-    subprocess.run(command, cwd=ROOT, check=True)
+    subprocess.run([command[0], str(ROOT / "run_backtest.py"), *command[1:]], cwd=ROOT, check=True)
 
 
 def all_exist(directory: Path, names: list[str]) -> bool:
@@ -164,10 +162,14 @@ def ensure_local_cache(args: argparse.Namespace, local_dir: Path, data_dir: Path
     LOGGER.info("Building local cache %s for %s-%s", local_dir, build_start, build_end)
     run_command([
         sys.executable,
-        "tools/build_local_backtest_data.py",
+        "prepare-data",
         "--start", build_start,
         "--end", build_end,
         "--output-dir", str(local_dir),
+        "--wind-baseinfo", str(data_dir / "wind_baseinfo.parquet"),
+        "--limit-label", str(data_dir / "FLAG_LIMIT_DAILY.parquet"),
+        "--trading-days", str(data_dir / "trading_days.txt"),
+        "--risk-dir", str(expand(args.risk_dir)),
     ])
 
 
@@ -182,7 +184,7 @@ def ensure_risk_cache(args: argparse.Namespace, local_dir: Path, risk_dir: Path,
     LOGGER.info("Building risk cache %s for %s-%s", risk_dir, build_start, build_end)
     run_command([
         sys.executable,
-        "tools/build_risk_model_data.py",
+        "risk-model",
         "--exposures", str(local_dir / "style_exposures.parquet"),
         "--industry-exposures", str(local_dir / "industry_exposures.parquet"),
         "--returns", str(local_dir / "asset_forward_returns.parquet"),
@@ -324,11 +326,11 @@ def single_factor_product(products: list[tuple[str | None, str | None, str]]) ->
             return product
     return products[0]
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run end-to-end factor and portfolio backtests.")
     parser.add_argument(
         "--factor-values",
-        default="/mnt/hdd/users/wangzhaochen/data/alpha/gru_T1/alpha_neu.parquet",
+        required=True,
     )
     parser.add_argument("--factor-column", default="alpha")
     parser.add_argument(
@@ -338,7 +340,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--start", required=True, help="Start date YYYYMMDD")
     parser.add_argument("--end", required=True, help="End date YYYYMMDD")
-    parser.add_argument("--data-dir", default="~/data")
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--risk-dir", required=True, help="Directory of Wind/RQ risk exposure parquet files")
     parser.add_argument("--cache-root", default="~/data/factor_evaluator_cache")
     parser.add_argument("--output-root", default="~/data/factor_evaluator_reports")
     parser.add_argument("--run-date", default=datetime.now().strftime("%Y%m%d"))
@@ -376,12 +379,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of product target-generation subprocesses to run concurrently.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
     start = args.start.replace("-", "")
     end = args.end.replace("-", "")
     products = select_products(args.benchmark)
@@ -414,10 +417,11 @@ def main() -> None:
         if missing_keys:
             run_command([
                 sys.executable,
-                "tools/fetch_wind_index_data.py",
+                "fetch-wind",
                 "--start", start,
                 "--end", end,
                 "--indexes", *sorted(set(missing_keys), key=lambda key: (len(key), key)),
+                "--calendar", str(data_dir / "trading_days.txt"),
                 "--output-dir", str(data_dir),
             ])
 
@@ -485,7 +489,7 @@ def main() -> None:
         )
         target_cmd = [
             sys.executable,
-            "tools/build_index_enhancement_targets.py",
+            "build-targets",
             "--factor-values", str(factor_path),
             "--factor-column", args.factor_column,
             "--benchmark", product_name,
@@ -585,7 +589,3 @@ def main() -> None:
     LOGGER.info("Local cache: %s", local_cache_dir)
     LOGGER.info("Risk cache: %s", risk_cache_dir)
     LOGGER.info("Generated %s factor files and %s portfolio files", len(factor_files), len(portfolio_files))
-
-
-if __name__ == "__main__":
-    main()

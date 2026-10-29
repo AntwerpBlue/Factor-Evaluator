@@ -1,8 +1,0 @@
-matplotlib>=3.8
-numpy>=1.26
-polars>=1.0
-scipy>=1.11
-xlsxwriter>=3.2
-
-[dev]
-pytest>=8.0

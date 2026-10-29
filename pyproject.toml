@@ -7,7 +7,7 @@ name = "factor-evaluator"
 version = "0.1.0"
 description = "A point-in-time safe single-factor and portfolio backtesting framework."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "matplotlib>=3.8",
   "numpy>=1.26",
@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+wind = ["PyYAML>=6.0", "SQLAlchemy>=2.0", "pyodbc>=5.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

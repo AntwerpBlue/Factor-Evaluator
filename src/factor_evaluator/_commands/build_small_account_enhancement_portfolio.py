@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build a small-account 60/40 HS300-plus-alpha holdings list.
 
 The default portfolio is 60% HS300 index instrument and 40% a concentrated
@@ -12,16 +11,13 @@ import argparse
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 import numpy as np
 import polars as pl
 from scipy.optimize import minimize
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
-from factor_evaluator.data import normalize_panel  # noqa: E402
+from factor_evaluator.data import normalize_panel
 
 
 LOGGER = logging.getLogger("build_small_account_enhancement_portfolio")
@@ -313,7 +309,7 @@ def index_row(args: argparse.Namespace, capital: float) -> dict[str, object]:
     return row
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a 60/40 HS300 plus concentrated stock enhancement holdings list.")
     parser.add_argument("--factor-values", required=True, help="Factor parquet/csv with date + code/header + factor column")
     parser.add_argument("--factor-column", default="alpha")
@@ -347,12 +343,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-lot-size", type=int, default=100)
     parser.add_argument("--output", default="~/data/small_account_portfolios/hs300_plus_alpha.parquet")
     parser.add_argument("--summary-output", help="Optional JSON summary path")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
     if not np.isclose(args.index_weight + args.stock_sleeve_weight, 1.0):
         raise ValueError("index_weight + stock_sleeve_weight must equal 1")
     if args.holdings < 1:
@@ -470,7 +466,3 @@ def main() -> None:
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("Wrote %s and %s", output, csv_path)
     LOGGER.info("Summary: %s", json.dumps(summary, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()

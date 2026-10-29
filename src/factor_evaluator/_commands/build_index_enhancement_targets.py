@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build index-enhancement target weights from factor signals.
 
 The optimizer is factor_evaluator.portfolio.IndexEnhancementStrategy. Inputs are
@@ -10,13 +9,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 from pathlib import Path
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from factor_evaluator import ExposureMatrixProvider, IndexEnhancementConfig, IndexEnhancementStrategy, RiskMatrixProvider
 from factor_evaluator.data import normalize_panel
@@ -80,7 +76,7 @@ def filter_by_panel_flag(frame: pl.DataFrame, flag: pl.DataFrame, column: str) -
     return frame.join(keep, on=["date", "asset"], how="inner").filter(pl.col("_keep")).drop("_keep")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build optimized index-enhancement target weights.")
     parser.add_argument("--factor-values", required=True, help="External factor parquet/csv")
     parser.add_argument("--factor-column", help="Factor column to optimize on")
@@ -114,12 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-short", action="store_true", help="Allow short positions")
     parser.add_argument("--start")
     parser.add_argument("--end")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
 
     data_dir = expand(args.data_dir)
     zero_benchmark = BENCHMARK_WEIGHT_FILES[args.benchmark] is None
@@ -216,7 +212,3 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     targets.rename({"asset": "code"}).write_parquet(output)
     LOGGER.info("Wrote %s (%s rows)", output, targets.height)
-
-
-if __name__ == "__main__":
-    main()

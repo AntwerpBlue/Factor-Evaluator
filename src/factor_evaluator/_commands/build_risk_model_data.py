@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build EWMA risk-model data from local Factor Evaluator input parquet files."""
 
 from __future__ import annotations
@@ -6,15 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 from pathlib import Path
 
 import polars as pl
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
-from factor_evaluator.risk import (  # noqa: E402
+from factor_evaluator.risk import (
     estimate_factor_returns,
     ewma_factor_covariance,
     ewma_specific_risk,
@@ -79,9 +75,8 @@ def split_factor_returns(factor_returns: pl.DataFrame, style_columns: list[str])
     return factor_returns.select("date", *styles), factor_returns.select("date", *industries)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build factor returns and EWMA risk estimates.")
-    parser.add_argument("--data-dir", default="~/data")
     parser.add_argument("--exposures", default="~/data/style_exposures.parquet")
     parser.add_argument("--industry-exposures", default="~/data/industry_exposures.parquet")
     parser.add_argument("--returns", default="~/data/asset_forward_returns.parquet")
@@ -102,12 +97,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not append industry exposure columns to the regression design.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
 
     output_dir = expand(args.output_dir)
     exposures = date_filter(load_frame(expand(args.exposures)), args.start, args.end)
@@ -148,7 +143,3 @@ def main() -> None:
     write_frame(specific_returns, output_dir / "specific_return_daily.parquet")
     write_frame(factor_covariance, output_dir / "factor_covariance.parquet")
     write_frame(specific_risk, output_dir / "specific_risk.parquet")
-
-
-if __name__ == "__main__":
-    main()

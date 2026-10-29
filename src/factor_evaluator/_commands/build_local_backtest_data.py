@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Build Factor Evaluator input tables from local Wind/RQ data.
 
 This script produces framework-ready parquet files under ~/data by default:
@@ -15,7 +14,7 @@ This script produces framework-ready parquet files under ~/data by default:
     industry_exposures.parquet
 
 Factor values remain an external input. Benchmark returns/weights are generated
-by tools/fetch_wind_index_data.py.
+by run_backtest.py fetch-wind.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ LOGGER = logging.getLogger("build_local_backtest_data")
 DEFAULT_WIND_BASEINFO = "~/data/wind_baseinfo.parquet"
 DEFAULT_LIMIT_LABEL = "~/data/FLAG_LIMIT_DAILY.parquet"
 DEFAULT_TRADING_DAYS = "~/data/trading_days.txt"
-DEFAULT_RISK_DIR = "/mnt/hdd/researchshare/RQRiskData/BarraStyleFactor"
+DEFAULT_RISK_DIR = None
 DEFAULT_OUTPUT = "~/data"
 
 STYLE_COLUMNS = [
@@ -62,7 +61,7 @@ def expand(path: str | Path) -> Path:
     return Path(os.path.expanduser(str(path)))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build local backtest input parquet files.")
     parser.add_argument("--wind-baseinfo", default=DEFAULT_WIND_BASEINFO)
     parser.add_argument("--limit-label", default=DEFAULT_LIMIT_LABEL)
@@ -76,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip style_exposures and industry_exposures generation.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def normalize_date_expr(column: str) -> pl.Expr:
@@ -249,9 +248,11 @@ def build_risk_exposures(risk_dir: Path, start: str | None, end: str | None) -> 
     return style_exposures, industry_exposures
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    args = parse_args()
+    args = parse_args(argv)
+    if not args.no_risk and not args.risk_dir:
+        raise ValueError("--risk-dir is required unless --no-risk is set")
     output_dir = expand(args.output_dir)
 
     wind = read_wind_baseinfo(expand(args.wind_baseinfo), args.start, args.end)
@@ -270,7 +271,3 @@ def main() -> None:
         style_exposures, industry_exposures = build_risk_exposures(expand(args.risk_dir), args.start, args.end)
         write_frame(style_exposures, output_dir / "style_exposures.parquet")
         write_frame(industry_exposures, output_dir / "industry_exposures.parquet")
-
-
-if __name__ == "__main__":
-    main()
