@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 from scipy.optimize import linprog, minimize
 from scipy import sparse
 
 from .data import PortfolioDataset, normalize_panel
+from .risk import FactorCovarianceMatrix, RiskMatrixProvider, decision_timestamp
+from .alpha_calibration import CalibrationState, RankReturnCalibrator, signal_ranks
 from .metrics import annualized_return, annualized_volatility, safe_mean, sharpe_ratio
 
 
@@ -33,12 +32,17 @@ class IndexEnhancementConfig:
     max_trade_weight: float | None = None
     zero_benchmark: bool = False
     require_covariance: bool = False
-    alpha_transform: Literal["none", "zscore", "rank_zscore"] = "zscore"
+    alpha_transform: Literal["none", "zscore", "rank_zscore", "calibrated_rank"] = "zscore"
     alpha_scale: float = 1.0
     alpha_clip: float | None = 5.0
     alpha_return_scale: float | None = None
     risk_annualization: float = 252.0
     exposure_bounds: Mapping[str, tuple[float, float]] = field(default_factory=dict)
+    # None preserves the low-level legacy default; optimize_signal defaults to te_cost.
+    objective_mode: Literal["legacy", "te_cost"] | None = None
+    buy_cost_bps: float = 8.0
+    sell_cost_bps: float = 8.0
+    solver_time_limit: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -61,17 +65,99 @@ class OptimizationResult:
     diagnostics: dict[str, Any]
 
 
+def constraints_from_trade_status(trade_status, decision_time, assets, base=None, *, unknown_policy="reject") -> AssetConstraints:
+    """Use only status observations available strictly before this decision."""
+    cutoff = decision_timestamp(decision_time)
+    base = base or AssetConstraints()
+    rows = trade_status.to_dicts() if isinstance(trade_status, pl.DataFrame) else [
+        {**value, "asset": asset} for asset, value in trade_status.items()
+    ]
+    latest = {}
+    for row in rows:
+        asset = str(row.get("asset", row.get("code", row.get("header"))))
+        if row.get("observed_at") is None:
+            continue
+        timestamp = decision_timestamp(row["observed_at"])
+        if timestamp < cutoff and (asset not in latest or timestamp > latest[asset][0]):
+            latest[asset] = (timestamp, row)
+    frozen, no_buy, no_sell = set(base.frozen), set(base.no_buy), set(base.no_sell)
+    for asset in assets:
+        row = latest.get(asset, (None, {}))[1]
+        status = row.get("status")
+        label = row.get("limit_label")
+        known = (status in {"normal", "limit_up", "limit_down", "suspended"}
+            or label in {-1, 0, 1} or row.get("tradable") is not None
+            or (row.get("can_buy") is not None and row.get("can_sell") is not None)
+            or row.get("frozen") is True)
+        if not known:
+            if unknown_policy == "freeze":
+                frozen.add(asset)
+                continue
+            raise ValueError(f"Unknown pre-decision trading status for {asset}")
+        if status == "suspended" or row.get("tradable") is False or row.get("frozen") is True:
+            frozen.add(asset)
+        if status == "limit_up" or label == 1 or row.get("can_buy") is False:
+            no_buy.add(asset)
+        if status == "limit_down" or label == -1 or row.get("can_sell") is False:
+            no_sell.add(asset)
+    return AssetConstraints(base.weight_bounds, base.allowed_assets, tuple(frozen), tuple(no_buy), tuple(no_sell))
+
+
 class IndexEnhancementStrategy:
     """Small convex index-enhancement optimizer.
 
-    The optimizer maximizes expected alpha while penalizing active risk and
-    turnover. A full covariance matrix can be supplied; identity covariance is
-    used as a deterministic fallback for examples and tests.
+    optimize_signal defaults to expected active return minus estimated trading
+    costs with a hard TE budget. Low-level calls retain the legacy risk penalty
+    objective unless objective_mode is supplied explicitly.
     """
 
     def __init__(self, config: IndexEnhancementConfig | None = None):
         self.config = config or IndexEnhancementConfig()
         self.diagnostics: list[dict[str, Any]] = []
+
+    def optimize_signal(
+        self, *, signal, decision_time, benchmark_weights, current_weights,
+        risk_data: RiskMatrixProvider, trade_status,
+        calibration_state: CalibrationState | None = None,
+        asset_constraints: AssetConstraints | None = None,
+        alpha_transform="calibrated_rank", unknown_status_policy="reject",
+    ) -> OptimizationResult:
+        """One decision, using current holdings and prior-day Barra; never updates calibration."""
+        now = decision_timestamp(decision_time)
+        if "values" in signal:
+            if decision_timestamp(signal["observed_at"]) > now:
+                raise ValueError("Signal is not available at decision_time")
+            signal = signal["values"]
+        config = replace(self.config, objective_mode=self.config.objective_mode or "te_cost", alpha_transform=alpha_transform)
+        calibration_id, uncertainty = None, None
+        if alpha_transform == "calibrated_rank":
+            if calibration_state is None:
+                raise ValueError("calibrated_rank requires an explicit calibration_state")
+            if calibration_state.updated_at and decision_timestamp(calibration_state.updated_at) > now:
+                raise ValueError("Calibration state was not available at decision_time")
+            prediction = RankReturnCalibrator().predict(signal_ranks(signal), calibration_state, return_uncertainty=True)
+            mu, uncertainty = prediction["mu"], prediction["uncertainty"]
+            calibration_id, units = calibration_state.state_id, "return"
+        else:
+            mu = IndexEnhancementStrategy(config)._prepare_alpha(list(signal), list(signal.values()))
+            units = "return" if alpha_transform == "none" or config.alpha_return_scale is not None else "score"
+        base = asset_constraints or AssetConstraints()
+        assets = sorted(set(signal) | set(benchmark_weights) | set(current_weights) | base.assets())
+        restrictions = constraints_from_trade_status(trade_status, now, assets, base, unknown_policy=unknown_status_policy)
+        snapshot = risk_data.snapshot(now, assets)
+        result = IndexEnhancementStrategy(config).optimize_result(
+            mu, benchmark_weights, current_weights, snapshot.covariance, assets,
+            snapshot.covariance.exposures, exposure_names=snapshot.factor_names,
+            asset_constraints=restrictions, alpha_units=units,
+        )
+        result.diagnostics.update(
+            decision_time=now.isoformat(), barra_asof_date=snapshot.asof_date,
+            alpha_calibration_state_id=calibration_id,
+            alpha_calibration_basis=calibration_state.basis if calibration_id else None,
+            alpha_uncertainty=uncertainty,
+            active_exposures=result.diagnostics["named_active_exposures"],
+        )
+        return result
 
     def optimize(
         self,
@@ -108,6 +194,11 @@ class IndexEnhancementStrategy:
         exposure_names: Sequence[str] | None = None,
         asset_constraints: AssetConstraints | None = None,
     ) -> OptimizationResult:
+        mode = self.config.objective_mode or "legacy"
+        if mode == "te_cost" and (self.config.tracking_error is None or covariance is None):
+            raise ValueError("te_cost requires an explicit annual tracking_error budget and risk covariance")
+        if mode == "te_cost" and alpha_units != "return":
+            raise ValueError("te_cost requires expected returns, not uncalibrated scores")
         restrictions = asset_constraints or AssetConstraints()
         assets = list(assets) if assets is not None else sorted(set(alpha) | set(benchmark_weights) | set(previous_weights or {}) | restrictions.assets())
         missing_assets = (set(alpha) | set(benchmark_weights)) - set(assets)
@@ -138,12 +229,8 @@ class IndexEnhancementStrategy:
             ],
             dtype=float,
         )
-        if previous.sum() > 0:
-            previous /= previous.sum()
-        elif self.config.zero_benchmark:
+        if previous_weights is None and self.config.zero_benchmark:
             previous = np.full(len(assets), 1.0 / len(assets))
-        else:
-            previous = benchmark.copy()
         risk_source = "provided" if covariance is not None else "identity_regularizer"
         if covariance is None and (self.config.require_covariance or self.config.tracking_error is not None):
             raise ValueError(
@@ -161,11 +248,6 @@ class IndexEnhancementStrategy:
         exposure_matrix = (
             np.asarray(exposure_matrix, dtype=float)
             if exposure_matrix is not None
-            and (
-                self.config.active_exposure_penalty > 0
-                or self.config.active_exposure_limit is not None
-                or self.config.exposure_bounds
-            )
             else None
         )
         if exposure_matrix is not None and exposure_matrix.shape[0] != len(assets):
@@ -190,6 +272,9 @@ class IndexEnhancementStrategy:
 
         def turnover_cost(weight: np.ndarray) -> float:
             turnover_delta = weight - previous
+            if mode == "te_cost":
+                return float(self.config.buy_cost_bps / 10_000 * np.maximum(turnover_delta, 0).sum()
+                    + self.config.sell_cost_bps / 10_000 * np.maximum(-turnover_delta, 0).sum())
             return float(cost_rate * np.abs(turnover_delta).sum())
 
         def turnover_cost_jac(weight: np.ndarray) -> np.ndarray:
@@ -265,7 +350,10 @@ class IndexEnhancementStrategy:
         if restrictions.allowed_assets is not None:
             for i, asset in enumerate(assets):
                 if asset not in restrictions.allowed_assets:
-                    lower[i], upper[i] = max(lower[i], 0.0), min(upper[i], 0.0)
+                    # Legacy holdings outside the investment pool may be unsellable.
+                    locked = asset in restrictions.frozen or asset in restrictions.no_sell
+                    retained = previous[i] if locked else 0.0
+                    lower[i], upper[i] = max(lower[i], retained), min(upper[i], retained)
         for asset in restrictions.frozen:
             i = positions[asset]
             lower[i], upper[i] = max(lower[i], previous[i]), min(upper[i], previous[i])
@@ -339,8 +427,14 @@ class IndexEnhancementStrategy:
             violations = [name for name, value in slack.items() if not np.isfinite(value) or value < -1e-7]
             if not np.isfinite(solution).all() or violations:
                 raise RuntimeError(f"Optimizer produced unusable weights: {violations}; constraint slacks={slack}")
+            factor_risk, specific_risk = None, None
+            if isinstance(covariance, FactorCovarianceMatrix):
+                factor_active = covariance.exposures.T @ active
+                factor_risk = float(factor_active @ covariance.factor_covariance @ factor_active * self.config.risk_annualization)
+                specific_risk = float(np.sum((covariance.specific_variance + covariance.diagonal_jitter) * active**2) * self.config.risk_annualization)
             return OptimizationResult(dict(zip(assets, map(float, solution))), {
                 "solver": solver, "solver_status": status, "constraints_satisfied": True,
+                "objective_mode": mode,
                 "constraint_slacks": slack, "alpha_units": alpha_units,
                 "expected_alpha": float(expected @ solution),
                 "expected_active_alpha": float(expected @ active),
@@ -350,10 +444,20 @@ class IndexEnhancementStrategy:
                 "max_weight": float(np.max(solution)), "max_active_weight": float(np.max(np.abs(active))),
                 "active_exposures": exposures.tolist(), "risk_source": risk_source,
                 "named_active_exposures": dict(zip(names, exposures.tolist())),
+                "predicted_returns": dict(zip(assets, map(float, expected))),
+                "predicted_te": annual_te if risk_source == "provided" else None,
+                "factor_risk": factor_risk, "specific_risk": specific_risk,
                 "risk_annualization": self.config.risk_annualization,
                 "tracking_error_annual": annual_te if risk_source == "provided" else None,
                 "volatility_annual": float(np.sqrt(max(self._risk_quadratic(covariance, solution), 0.0) * self.config.risk_annualization)) if risk_source == "provided" else None,
             })
+
+        if mode == "te_cost":
+            solution, status = self._cost_budget_optimize(
+                expected, benchmark, previous, lower, upper, covariance,
+                exposure_matrix, exposure_lower, exposure_upper,
+            )
+            return finish(solution, "clarabel", status)
 
         if use_linear_program:
             solution = self._linear_optimize(
@@ -431,6 +535,79 @@ class IndexEnhancementStrategy:
         if not result.success:
             raise RuntimeError(f"Index enhancement optimization failed: {result.message}")
         return finish(result.x, "SLSQP", str(result.message))
+
+    def _cost_budget_optimize(self, mu, benchmark, previous, lower, upper, covariance, exposures, exposure_lower, exposure_upper):
+        """Sparse SOCP over active weights, buys, sells and factor exposures.
+
+        Factor-form input never forms an N x N covariance or quadratic objective.
+        """
+        import clarabel
+
+        n = len(mu)
+        if isinstance(covariance, FactorCovarianceMatrix):
+            x = sparse.csc_matrix(covariance.exposures.T)
+            omega = covariance.factor_covariance
+            d = covariance.specific_variance + covariance.diagonal_jitter
+        else:
+            # Dense covariance is only used when explicitly supplied by the caller.
+            x = sparse.eye(n, format="csc")
+            omega = np.asarray(covariance)
+            d = np.zeros(n)
+        k, size = x.shape[0], 3 * n + x.shape[0]
+        eigenvalues, eigenvectors = np.linalg.eigh(omega)
+        root = sparse.csc_matrix(np.sqrt(np.maximum(eigenvalues, 0))[:, None] * eigenvectors.T)
+        identity = sparse.eye(n, format="csc")
+        znn, znk = sparse.csc_matrix((n, n)), sparse.csc_matrix((n, k))
+        blocks, rhs, cones = [], [], []
+
+        def add(matrix, values, cone):
+            blocks.append(sparse.csc_matrix(matrix))
+            rhs.append(np.asarray(values, dtype=float))
+            cones.append(cone(len(values)))
+
+        # a = w-b, a-buy+sell = p-b, and f = X' a.
+        add(sparse.hstack([np.ones((1, n)), sparse.csc_matrix((1, 2*n+k))]), [1-benchmark.sum()], clarabel.ZeroConeT)
+        add(sparse.hstack([identity, -identity, identity, znk]), previous-benchmark, clarabel.ZeroConeT)
+        add(sparse.hstack([-x, sparse.csc_matrix((k, 2*n)), sparse.eye(k)]), np.zeros(k), clarabel.ZeroConeT)
+        add(sparse.hstack([identity, znn, znn, znk]), upper-benchmark, clarabel.NonnegativeConeT)
+        add(sparse.hstack([-identity, znn, znn, znk]), benchmark-lower, clarabel.NonnegativeConeT)
+        add(sparse.hstack([znn, -identity, znn, znk]), np.zeros(n), clarabel.NonnegativeConeT)
+        add(sparse.hstack([znn, znn, -identity, znk]), np.zeros(n), clarabel.NonnegativeConeT)
+        if exposures is not None:
+            e = sparse.hstack([sparse.csc_matrix(exposures.T), sparse.csc_matrix((exposures.shape[1], 2*n+k))], format="csc")
+            equal = exposure_lower == exposure_upper
+            for mask, sign, limits, cone in (
+                (equal, 1, exposure_lower, clarabel.ZeroConeT),
+                (np.isfinite(exposure_upper) & ~equal, 1, exposure_upper, clarabel.NonnegativeConeT),
+                (np.isfinite(exposure_lower) & ~equal, -1, exposure_lower, clarabel.NonnegativeConeT),
+            ):
+                if mask.any():
+                    add(sign*e[mask], sign*limits[mask], cone)
+        buy_rate, sell_rate = self.config.buy_cost_bps/10_000, self.config.sell_cost_bps/10_000
+        if self.config.max_turnover is not None:
+            add(np.r_[np.zeros(n), np.full(2*n, .5), np.zeros(k)][None, :], [self.config.max_turnover], clarabel.NonnegativeConeT)
+        if self.config.turnover_cost_alpha_fraction is not None:
+            fraction = self.config.turnover_cost_alpha_fraction
+            row = np.r_[-fraction*mu, np.full(n, buy_rate), np.full(n, sell_rate), np.zeros(k)]
+            add(row[None, :], [fraction*float(mu @ (benchmark-previous))], clarabel.NonnegativeConeT)
+        risk_rows = sparse.vstack([
+            sparse.csc_matrix((1, size)),
+            sparse.hstack([sparse.diags(-np.sqrt(d)), znn, znn, znk]),
+            sparse.hstack([sparse.csc_matrix((k, 3*n)), -root]),
+        ], format="csc")
+        add(risk_rows, np.r_[self.config.tracking_error / np.sqrt(self.config.risk_annualization), np.zeros(n+k)], clarabel.SecondOrderConeT)
+        q = np.r_[-mu, np.full(n, buy_rate), np.full(n, sell_rate), np.zeros(k)]
+        settings = clarabel.DefaultSettings()
+        settings.verbose = False
+        settings.time_limit = self.config.solver_time_limit
+        settings.tol_gap_abs = settings.tol_feas = settings.tol_gap_rel = 1e-9
+        solver = clarabel.DefaultSolver(sparse.csc_matrix((size, size)), q,
+            sparse.vstack(blocks, format="csc"), np.concatenate(rhs), cones, settings)
+        result = solver.solve()
+        status = str(result.status)
+        if status not in {"Solved", "AlmostSolved"}:
+            raise RuntimeError(f"Portfolio optimization failed: {status}")
+        return benchmark + np.asarray(result.x[:n]), status
 
     @staticmethod
     def _risk_matvec(covariance: Any, value: np.ndarray) -> np.ndarray:
@@ -599,6 +776,7 @@ class IndexEnhancementStrategy:
         initial_weights: Mapping[str, float] | None = None,
         asset_constraints_by_date: Mapping[str, AssetConstraints] | Callable[[str], AssetConstraints] | None = None,
         exposure_names: Sequence[str] | None = None,
+        calibration_states_by_date: Mapping[str, CalibrationState] | None = None,
     ) -> pl.DataFrame:
         self.diagnostics = []
         signal_panel = normalize_panel(signals)
@@ -610,7 +788,9 @@ class IndexEnhancementStrategy:
             raise ValueError("signals and benchmark_weights each require one value column")
         signal_column, weight_column = signal_columns[0], weight_columns[0]
         signal_dates = {
-            day["date"][0]: self._prepare_alpha(day["asset"].to_list(), day[signal_column].to_list())
+            day["date"][0]: self._prepare_alpha(day["asset"].to_list(), day[signal_column].to_list(),
+                calibration_states_by_date[day["date"][0]] if calibration_states_by_date is not None else None,
+                day["date"][0])
             for day in signal_panel.partition_by("date", maintain_order=True)
         }
         benchmark_dates = {
@@ -652,11 +832,15 @@ class IndexEnhancementStrategy:
                 else AssetConstraints()
             )
             assets = sorted(set(signal_dates[date]) | set(benchmark_dates[date]) | set(previous_for_opt or {}) | restrictions.assets())
-            if callable(covariance_by_date):
+            snapshot = None
+            if isinstance(covariance_by_date, RiskMatrixProvider):
+                snapshot = covariance_by_date.snapshot(date, assets)
+                covariance = snapshot.covariance
+            elif callable(covariance_by_date):
                 covariance = covariance_by_date(date, assets)
             else:
                 covariance = (covariance_by_date or {}).get(date)
-            exposure_matrix = exposure_by_date(date, assets) if exposure_by_date is not None else None
+            exposure_matrix = snapshot.covariance.exposures if snapshot else exposure_by_date(date, assets) if exposure_by_date is not None else None
             if covariance is None and covariance_by_date is not None:
                 raise ValueError(f"Risk covariance unavailable on {date}")
             if exposure_matrix is None and exposure_by_date is not None:
@@ -668,11 +852,13 @@ class IndexEnhancementStrategy:
                 covariance,
                 assets=assets,
                 exposure_matrix=exposure_matrix,
-                alpha_units="return" if self.config.alpha_transform == "none" or self.config.alpha_return_scale is not None else "score",
-                exposure_names=exposure_names if exposure_names is not None else getattr(exposure_by_date, "exposure_columns", None),
+                alpha_units="return" if self.config.alpha_transform in {"none", "calibrated_rank"} or self.config.alpha_return_scale is not None else "score",
+                exposure_names=snapshot.factor_names if snapshot else exposure_names if exposure_names is not None else getattr(exposure_by_date, "exposure_columns", None),
                 asset_constraints=restrictions,
             )
             weights = result.weights
+            result.diagnostics["barra_asof_date"] = snapshot.asof_date if snapshot else None
+            result.diagnostics["alpha_calibration_state_id"] = calibration_states_by_date[date].state_id if calibration_states_by_date else None
             self.diagnostics.append({"date": date, **result.diagnostics})
             rows.extend(
                 {"date": date, "asset": asset, "weight": weight}
@@ -684,7 +870,13 @@ class IndexEnhancementStrategy:
             return pl.DataFrame(schema={"date": pl.String, "asset": pl.String, "weight": pl.Float64})
         return pl.DataFrame(rows)
 
-    def _prepare_alpha(self, assets: list[str], values: list[float]) -> dict[str, float]:
+    def _prepare_alpha(self, assets: list[str], values: list[float], calibration_state=None, decision_time=None) -> dict[str, float]:
+        if self.config.alpha_transform == "calibrated_rank":
+            if calibration_state is None:
+                raise ValueError("calibrated_rank requires a previously computed calibration state")
+            if decision_time and calibration_state.updated_at and decision_timestamp(calibration_state.updated_at) > decision_timestamp(decision_time):
+                raise ValueError("Calibration state was not available at decision_time")
+            return RankReturnCalibrator().predict(signal_ranks(dict(zip(assets, values))), calibration_state)
         raw = np.asarray(values, dtype=float)
         finite = np.isfinite(raw)
         transformed = np.zeros_like(raw, dtype=float)

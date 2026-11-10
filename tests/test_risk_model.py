@@ -70,7 +70,7 @@ def test_risk_matrix_provider_aligns_requested_asset_order():
         ]
     )
     provider = RiskMatrixProvider(exposures, factor_covariance, specific_risk, diagonal_jitter=0.0)
-    sigma = provider("20240102", ["000002", "000001"])
+    sigma = provider("20240103", ["000002", "000001"])
     x = np.asarray([[3.0, 4.0], [1.0, 2.0]])
     f = np.asarray([[0.10, 0.01], [0.01, 0.20]])
     expected = x @ f @ x.T + np.diag([0.002, 0.001])
@@ -98,10 +98,10 @@ def test_risk_matrix_provider_returns_lazy_factor_form_by_default():
         ]
     )
     provider = RiskMatrixProvider(exposures, factor_covariance, specific_risk, diagonal_jitter=0.0)
-    lazy = provider("20240102", ["000002", "000001"])
+    lazy = provider("20240103", ["000002", "000001"])
     dense = RiskMatrixProvider(
         exposures, factor_covariance, specific_risk, diagonal_jitter=0.0, dense=True
-    )("20240102", ["000002", "000001"])
+    )("20240103", ["000002", "000001"])
     assert isinstance(lazy, FactorCovarianceMatrix)
     vector = np.asarray([0.2, -0.1])
     np.testing.assert_allclose(lazy @ vector, dense @ vector)

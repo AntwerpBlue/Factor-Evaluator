@@ -8,13 +8,9 @@ from .config import (
     load_portfolio_dataset,
     load_target_weights,
 )
-from .factor import FactorBacktestConfig, FactorBacktestResult, FactorBacktester
-from .evaluation import (
-    FactorEvaluationConfig,
-    FactorEvaluationResult,
-    evaluate_factors,
-)
+from importlib import import_module
 from .risk import (
+    BarraSnapshot,
     ExposureMatrixProvider,
     FactorCovarianceMatrix,
     RiskMatrixProvider,
@@ -33,6 +29,21 @@ from .portfolio import (
     PortfolioBacktestResult,
     PortfolioBacktester,
 )
+from .alpha_calibration import CalibrationState, RankReturnCalibrator
+
+
+def __getattr__(name):
+    # Standalone portfolio optimization does not need plotting/report imports.
+    module = {
+        "FactorBacktestConfig": ".factor", "FactorBacktestResult": ".factor",
+        "FactorBacktester": ".factor", "FactorEvaluationConfig": ".evaluation",
+        "FactorEvaluationResult": ".evaluation", "evaluate_factors": ".evaluation",
+    }.get(name)
+    if module is None:
+        raise AttributeError(name)
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "FactorDataset",
@@ -51,11 +62,14 @@ __all__ = [
     "IndexEnhancementConfig",
     "IndexEnhancementStrategy",
     "OptimizationResult",
+    "CalibrationState",
+    "RankReturnCalibrator",
     "AssetConstraints",
     "PortfolioBacktestConfig",
     "PortfolioBacktestResult",
     "PortfolioBacktester",
     "ExposureMatrixProvider",
+    "BarraSnapshot",
     "FactorCovarianceMatrix",
     "RiskMatrixProvider",
     "RiskModelEstimate",

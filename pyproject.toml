@@ -13,6 +13,7 @@ dependencies = [
   "numpy>=1.26",
   "polars>=1.0",
   "scipy>=1.11",
+  "clarabel>=0.9",
   "xlsxwriter>=3.2",
 ]
 

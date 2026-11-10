@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from bisect import bisect_left
+from datetime import datetime, timezone, timedelta
 from typing import Iterable
 
 import numpy as np
 import polars as pl
 
 from .data import normalize_panel
+
+
+def decision_timestamp(value: str | datetime) -> datetime:
+    """Naive timestamps denote exchange local time (Asia/Shanghai)."""
+    value = datetime.fromisoformat(value) if isinstance(value, str) else value
+    exchange_tz = timezone(timedelta(hours=8))
+    return value.replace(tzinfo=exchange_tz) if value.tzinfo is None else value.astimezone(exchange_tz)
+
+
+@dataclass(frozen=True)
+class BarraSnapshot:
+    asof_date: str
+    factor_names: list[str]
+    covariance: FactorCovarianceMatrix
 
 
 @dataclass(frozen=True)
@@ -241,7 +257,7 @@ class ExposureMatrixProvider:
         exposures: pl.DataFrame,
         *,
         exposure_columns: list[str] | None = None,
-        standardize: bool = True,
+        standardize: bool = False,
     ) -> None:
         panel = normalize_panel(exposures)
         self.exposure_columns = exposure_columns or infer_factor_columns(panel)
@@ -256,11 +272,13 @@ class ExposureMatrixProvider:
             day["date"][0]: day.select("asset", *self.exposure_columns)
             for day in panel.partition_by("date", maintain_order=True)
         }
+        self.snapshot_dates = sorted(self.exposures_by_date)
 
     def __call__(self, date: str, assets: list[str]) -> np.ndarray | None:
-        frame = self.exposures_by_date.get(date)
-        if frame is None:
+        index = bisect_left(self.snapshot_dates, decision_timestamp(date).strftime("%Y%m%d")) - 1
+        if index < 0:
             return None
+        frame = self.exposures_by_date[self.snapshot_dates[index]]
         ordered = pl.DataFrame({"asset": assets}).join(frame, on="asset", how="left")
         return (
             ordered.select([
@@ -289,8 +307,9 @@ class ExposureMatrixProvider:
 class RiskMatrixProvider:
     """Build stock covariance matrices on demand from factor risk data.
 
-    For a requested date and ordered asset list, returns ``Sigma = X F X' + D``
-    in exactly that asset order. Missing exposures are filled with zero, and
+    Selects the latest common X/F/D snapshot strictly before the trading date,
+    regardless of the intraday decision time. Returns ``Sigma = X F X' + D``
+    in exactly the requested asset order. Missing exposures are filled with zero, and
     missing specific variances fall back to the date median or ``specific_var_floor``.
     """
 
@@ -321,16 +340,27 @@ class RiskMatrixProvider:
         }
         self.covariance_by_date = self._build_covariance_by_date(factor_covariance)
         self.specific_by_date = self._build_specific_by_date(specific_risk)
+        # Each date represents one complete historical vendor snapshot.
+        self.snapshot_dates = sorted(self.exposures_by_date.keys() & self.covariance_by_date.keys() & self.specific_by_date.keys())
 
     def __call__(self, date: str, assets: list[str]) -> FactorCovarianceMatrix | np.ndarray | None:
-        exposure_frame = self.exposures_by_date.get(date)
-        covariance = self.covariance_by_date.get(date)
-        if exposure_frame is None or covariance is None:
-            return None
+        snapshot = self.snapshot(date, assets)
+        return snapshot.covariance.to_numpy() if self.dense else snapshot.covariance
+
+    def snapshot(self, decision_time: str | datetime, assets: list[str]) -> BarraSnapshot:
+        cutoff = decision_timestamp(decision_time).strftime("%Y%m%d")
+        index = bisect_left(self.snapshot_dates, cutoff) - 1
+        if index < 0:
+            raise ValueError(f"No Barra snapshot strictly before trading date {cutoff}")
+        date = self.snapshot_dates[index]
+        covariance, names = self._matrix_at(date, assets)
+        return BarraSnapshot(date, names, covariance)
+
+    def _matrix_at(self, date: str, assets: list[str]):
+        exposure_frame = self.exposures_by_date[date]
+        covariance = self.covariance_by_date[date]
         factor_index, factor_covariance = covariance
         factors = [factor for factor in self.factor_columns if factor in factor_index]
-        if not factors:
-            return None
         idx = [factor_index[factor] for factor in factors]
         f_matrix = factor_covariance[np.ix_(idx, idx)]
         asset_frame = pl.DataFrame({"asset": assets})
@@ -352,7 +382,7 @@ class RiskMatrixProvider:
             specific_variance=diagonal,
             diagonal_jitter=self.diagonal_jitter,
         )
-        return factor_matrix.to_numpy() if self.dense else factor_matrix
+        return factor_matrix, factors
 
     def _specific_fallback(self, specific: dict[str, float]) -> float:
         values = np.asarray([value for value in specific.values() if np.isfinite(value) and value > 0], dtype=float)

@@ -17,8 +17,9 @@ from pathlib import Path
 import polars as pl
 
 
-from factor_evaluator import AssetConstraints, ExposureMatrixProvider, IndexEnhancementConfig, IndexEnhancementStrategy, RiskMatrixProvider
+from factor_evaluator import AssetConstraints, CalibrationState, ExposureMatrixProvider, IndexEnhancementConfig, IndexEnhancementStrategy, RiskMatrixProvider
 from factor_evaluator.data import normalize_panel
+from factor_evaluator.risk import decision_timestamp
 
 
 LOGGER = logging.getLogger("build_index_enhancement_targets")
@@ -128,15 +129,15 @@ def asset_constraint_provider(
 
 
 def make_exposure_provider(args, exposure_bounds):
-    """Style bands use standardized styles; industry bands use raw 0/1 exposures."""
+    """Legacy exposure-only path, using prior snapshots without restandardization."""
     needs_style = args.style_exposure_penalty > 0 or args.style_exposure_limit is not None or any(not name.startswith("industry:") for name in exposure_bounds)
     providers = []
     if needs_style:
-        styles = date_filter(load_frame(expand(args.risk_exposures)), args.start, args.end)
+        styles = load_frame(expand(args.risk_exposures))
         providers.append(ExposureMatrixProvider(styles))
     industry_names = [name for name in exposure_bounds if name.startswith("industry:")]
     if industry_names:
-        industry = constraint_panel(date_filter(load_frame(expand(args.industry_exposures)), args.start, args.end))
+        industry = constraint_panel(load_frame(expand(args.industry_exposures)))
         if "industry" in industry.columns:
             industry = industry.select("date", "asset", *[
                 (pl.col("industry").cast(pl.String) == name.removeprefix("industry:")).cast(pl.Float64).alias(name)
@@ -164,6 +165,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build optimized index-enhancement target weights.")
     parser.add_argument("--factor-values", required=True, help="External factor parquet/csv")
     parser.add_argument("--factor-column", help="Factor column to optimize on")
+    parser.add_argument("--decision-time", help="Single decision timestamp, exchange-local time or ISO offset; enables optimize_signal.")
+    parser.add_argument("--signal-time", help="Availability timestamp for a signal file without a signal_time column.")
+    parser.add_argument("--trade-status", help="Pre-decision status table: observed_at, code, status or trading permissions.")
+    parser.add_argument("--unknown-status-policy", choices=("reject", "freeze"), default="reject")
+    parser.add_argument("--calibration-state", help="Externally computed CalibrationState JSON; never updated by this command.")
+    parser.add_argument("--objective-mode", choices=("legacy", "te_cost"), help="Single-decision default: te_cost. Daily legacy workflow default: legacy.")
+    parser.add_argument("--buy-cost-bps", type=float, default=8.0)
+    parser.add_argument("--sell-cost-bps", type=float, default=8.0)
+    parser.add_argument("--solver-time-limit", type=float, default=30.0)
     parser.add_argument("--benchmark", default="500", choices=sorted(BENCHMARK_WEIGHT_FILES))
     parser.add_argument("--data-dir", default="~/data")
     parser.add_argument("--benchmark-weights", help="Override benchmark weights file")
@@ -174,7 +184,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--asset-returns", help="Asset return panel used to drift previous target weights before optimization.")
     parser.add_argument("--previous-weights", help="Current pre-trade holdings (date, code, weight); uses the last snapshot as initial holdings.")
     parser.add_argument("--output", default="~/data/target_weights.parquet")
-    parser.add_argument("--use-risk-model", action="store_true", help="Use X F X' + D risk matrices from EWMA risk files.")
+    parser.add_argument("--use-risk-model", action="store_true", help="Use prior-day X F X' + D snapshots in legacy daily mode; always used for a single decision.")
     parser.add_argument("--risk-exposures", default="~/data/style_exposures.parquet")
     parser.add_argument("--industry-exposures", default="~/data/industry_exposures.parquet")
     parser.add_argument("--factor-covariance", default="~/data/factor_covariance.parquet")
@@ -182,7 +192,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--specific-var-floor", type=float, default=1e-8)
     parser.add_argument("--style-exposure-penalty", type=float, default=0.0, help="Soft penalty for active style exposure squared norm.")
     parser.add_argument("--style-exposure-limit", type=float, help="Hard active style exposure band, matching style_bands semantics.")
-    parser.add_argument("--alpha-transform", default="zscore", choices=("none", "zscore", "rank_zscore"))
+    parser.add_argument("--alpha-transform", choices=("none", "zscore", "rank_zscore", "calibrated_rank"), help="Single-decision default calibrated_rank; legacy daily default zscore.")
     parser.add_argument("--alpha-scale", type=float, default=1.0)
     parser.add_argument("--alpha-return-scale", type=float, help="Expected return per transformed score unit, applied after clipping; same horizon as covariance.")
     parser.add_argument("--alpha-clip", type=float, default=5.0)
@@ -203,9 +213,114 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def load_barra(args):
+    # Keep history before the requested interval; asof selection happens at decision time.
+    exposures = constraint_panel(load_frame(expand(args.risk_exposures)))
+    industry_path = expand(args.industry_exposures)
+    if industry_path.exists():
+        industry = constraint_panel(load_frame(industry_path))
+        if "industry" in industry.columns:
+            labels = industry["industry"].drop_nulls().unique().to_list()
+            industry = industry.select("date", "asset", *[
+                (pl.col("industry") == label).cast(pl.Float64).alias(f"industry:{label}") for label in labels
+            ])
+        extras = [c for c in industry.columns if c not in exposures.columns]
+        if extras:
+            exposures = exposures.join(industry.select("date", "asset", *extras), on=["date", "asset"], how="left")
+    return RiskMatrixProvider(exposures, load_frame(expand(args.factor_covariance)),
+        load_frame(expand(args.specific_risk)), specific_var_floor=args.specific_var_floor)
+
+
+def snapshot_rows(path, now):
+    """Adapt a current snapshot or choose latest dated observations available by now."""
+    frame = load_frame(expand(path))
+    code = next(name for name in ("asset", "code", "header") if name in frame.columns)
+    frame = frame.rename({code: "asset"}).with_columns(pl.col("asset").cast(pl.String).str.slice(0, 6))
+    rows = frame.to_dicts()
+    time_column = "observed_at" if "observed_at" in frame.columns else "date" if "date" in frame.columns else None
+    if time_column:
+        available = [(decision_timestamp(str(row[time_column])), row) for row in rows]
+        available = [(timestamp, row) for timestamp, row in available if timestamp <= now]
+        snapshot_time = max((timestamp for timestamp, _ in available), default=None)
+        rows = [row for timestamp, row in available if timestamp == snapshot_time]
+    return rows
+
+
+def run_signal_decision(args):
+    now = decision_timestamp(args.decision_time)
+    signal_frame = load_frame(expand(args.factor_values))
+    code = next(name for name in ("asset", "code", "header") if name in signal_frame.columns)
+    factor = args.factor_column or next(c for c in signal_frame.columns if c not in {code, "date", "signal_time", "observed_at"})
+    signals = {}
+    for row in signal_frame.iter_rows(named=True):
+        timestamp = row.get("signal_time", args.signal_time)
+        if timestamp is None:
+            raise ValueError("Single-decision signals require signal_time or --signal-time")
+        timestamp = decision_timestamp(timestamp)
+        asset = str(row[code])[:6]
+        if timestamp <= now and (asset not in signals or timestamp > signals[asset][0]):
+            signals[asset] = (timestamp, float(row[factor]))
+    if not signals:
+        raise ValueError("No signal available at decision_time")
+    if not args.previous_weights:
+        raise ValueError("Single-decision optimization requires --previous-weights (actual positions)")
+    current = {row["asset"]: float(row["weight"]) for row in snapshot_rows(args.previous_weights, now)}
+    zero_benchmark = BENCHMARK_WEIGHT_FILES[args.benchmark] is None
+    benchmark_path = args.benchmark_weights or (expand(args.data_dir) / BENCHMARK_WEIGHT_FILES[args.benchmark] if not zero_benchmark else None)
+    benchmark = {row["asset"]: float(row["weight"]) for row in snapshot_rows(benchmark_path, now)} if benchmark_path else dict.fromkeys(signals, 0.0)
+    date = now.strftime("%Y%m%d")
+    benchmark_panel = pl.DataFrame([{"date": date, "asset": a, "weight": w} for a, w in benchmark.items()])
+    universe = None
+    if expand(args.universe).exists():
+        universe = pl.DataFrame([{**row, "date": date} for row in snapshot_rows(args.universe, now)])
+    panels = []
+    if args.asset_constraints:
+        panels.append(pl.DataFrame([{**row, "date": date} for row in snapshot_rows(args.asset_constraints, now)]))
+    restrictions = asset_constraint_provider(benchmark_panel, universe, panels, args.allow_off_benchmark or zero_benchmark)(date)
+    status_path = args.trade_status or args.tradability
+    if expand(status_path).exists():
+        trade_status = load_frame(expand(status_path))
+        status_code = next(name for name in ("asset", "code", "header") if name in trade_status.columns)
+        trade_status = trade_status.rename({status_code: "asset"}).with_columns(pl.col("asset").cast(pl.String).str.slice(0, 6))
+    else:
+        trade_status = {}
+    state = CalibrationState.from_dict(json.loads(expand(args.calibration_state).read_text(encoding="utf-8"))) if args.calibration_state else None
+    bounds = {}
+    if args.exposure_bounds:
+        with expand(args.exposure_bounds).open("rb") as stream:
+            bounds = tomllib.load(stream)["exposure_bounds"]
+    config = IndexEnhancementConfig(
+        objective_mode=args.objective_mode or "te_cost", tracking_error=args.tracking_error,
+        risk_annualization=args.risk_annualization, risk_aversion=args.risk_aversion,
+        turnover_penalty=args.turnover_penalty, buy_cost_bps=args.buy_cost_bps, sell_cost_bps=args.sell_cost_bps,
+        max_weight=args.max_weight, max_active_weight=args.max_active_weight, max_trade_weight=args.max_trade_weight,
+        max_turnover=args.max_daily_turnover, exposure_bounds=bounds, active_exposure_limit=args.style_exposure_limit,
+        active_exposure_penalty=args.style_exposure_penalty, zero_benchmark=zero_benchmark, long_only=not args.long_short,
+        alpha_scale=args.alpha_scale, alpha_clip=args.alpha_clip, alpha_return_scale=args.alpha_return_scale,
+        turnover_cost_bps=args.turnover_cost_bps,
+        turnover_cost_alpha_fraction=args.turnover_cost_alpha_fraction if args.turnover_cost_alpha_fraction > 0 else None,
+        solver_time_limit=args.solver_time_limit,
+    )
+    result = IndexEnhancementStrategy(config).optimize_signal(
+        signal={"observed_at": max(time for time, _ in signals.values()).isoformat(), "values": {a: value for a, (_, value) in signals.items()}},
+        decision_time=now, benchmark_weights=benchmark, current_weights=current, risk_data=load_barra(args),
+        trade_status=trade_status, calibration_state=state, asset_constraints=restrictions,
+        alpha_transform=args.alpha_transform or "calibrated_rank", unknown_status_policy=args.unknown_status_policy,
+    )
+    output = expand(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([{"date": date, "decision_time": now.isoformat(), "code": a, "weight": w} for a, w in result.weights.items()]).write_parquet(output)
+    output.with_suffix(".diagnostics.json").write_text(json.dumps(result.diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOGGER.info("Wrote target weights for %s to %s", now.isoformat(), output)
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args(argv)
+    if args.decision_time:
+        run_signal_decision(args)
+        return
+    args.alpha_transform = args.alpha_transform or "zscore"
 
     data_dir = expand(args.data_dir)
     zero_benchmark = BENCHMARK_WEIGHT_FILES[args.benchmark] is None
@@ -251,27 +366,18 @@ def main(argv: list[str] | None = None) -> None:
     if args.exposure_bounds:
         with expand(args.exposure_bounds).open("rb") as stream:
             exposure_bounds = tomllib.load(stream)["exposure_bounds"]
-    if args.style_exposure_penalty > 0 or args.style_exposure_limit is not None or exposure_bounds:
+    if not args.use_risk_model and (args.style_exposure_penalty > 0 or args.style_exposure_limit is not None or exposure_bounds):
         exposure_provider, exposure_names = make_exposure_provider(args, exposure_bounds)
 
     covariance_provider = None
     if args.use_risk_model:
-        risk_exposures = date_filter(normalize_panel(load_frame(expand(args.risk_exposures))), args.start, args.end)
-        industry_path = expand(args.industry_exposures)
-        if industry_path.exists():
-            industry_exposures = date_filter(normalize_panel(load_frame(industry_path)), args.start, args.end)
-            risk_exposures = risk_exposures.join(industry_exposures, on=["date", "asset"], how="inner")
-        factor_covariance = date_filter(load_frame(expand(args.factor_covariance)), args.start, args.end)
-        specific_risk = date_filter(load_frame(expand(args.specific_risk)), args.start, args.end)
-        covariance_provider = RiskMatrixProvider(
-            risk_exposures,
-            factor_covariance,
-            specific_risk,
-            specific_var_floor=args.specific_var_floor,
-        )
-        LOGGER.info("Using EWMA risk model for optimization")
+        covariance_provider = load_barra(args)
+        LOGGER.info("Using prior-day Barra snapshots for risk and exposure constraints")
 
     config = IndexEnhancementConfig(
+        objective_mode=args.objective_mode or "legacy",
+        buy_cost_bps=args.buy_cost_bps, sell_cost_bps=args.sell_cost_bps,
+        solver_time_limit=args.solver_time_limit,
         risk_aversion=args.risk_aversion,
         turnover_penalty=args.turnover_penalty,
         max_weight=args.max_weight,
@@ -303,6 +409,10 @@ def main(argv: list[str] | None = None) -> None:
         snapshot = snapshot.filter(pl.col("date") == snapshot["date"].max())
         initial_weights = dict(snapshot.select("asset", "weight").iter_rows())
     strategy = IndexEnhancementStrategy(config)
+    calibration_states = None
+    if args.calibration_state:
+        state = CalibrationState.from_dict(json.loads(expand(args.calibration_state).read_text(encoding="utf-8")))
+        calibration_states = dict.fromkeys(signals["date"].unique().to_list(), state)
     targets = strategy.build_targets(
         signals,
         benchmark_weights,
@@ -312,6 +422,7 @@ def main(argv: list[str] | None = None) -> None:
         initial_weights=initial_weights,
         asset_constraints_by_date=constraints_by_date,
         exposure_names=exposure_names,
+        calibration_states_by_date=calibration_states,
     )
     output = expand(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
